@@ -345,6 +345,7 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
+        # 默认即为因果推断
         self.is_causal = True
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
@@ -352,10 +353,12 @@ class LlamaAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-
+        # q_proj: [hidden_size, num_head*head_dim]
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        # k_proj, v_proj: [hidden_size, num_key_value_head*head_dim]
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        # q_proj: [hidden_size, hidden_size]
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
@@ -375,7 +378,7 @@ class LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        if self.config.pretraining_tp > 1:
+        if self.config.pretraining_tp > 1: # Tensor parallelism
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
                 (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
@@ -686,7 +689,8 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        #self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -728,9 +732,11 @@ class LlamaDecoderLayer(nn.Module):
         """
         residual = hidden_states
 
+        # 1. Self Attention: pre_norm + self_attention + residual
+        # 1.1 layer norm
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self Attention
+        # 1.2 Casual Masked Self Attention(因果attention)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -742,9 +748,11 @@ class LlamaDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+
+        # 1.3 Add
         hidden_states = residual + hidden_states
 
-        # Fully Connected
+        # 2. Fully Connected: pre_norm + mlp + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -1108,6 +1116,7 @@ class LlamaModel(LlamaPreTrainedModel):
         return causal_mask
 
 
+# LlamaForCasulalLM:只是在LlamaModel中加了一个LanguageModel head
 class LlamaForCausalLM(LlamaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -1607,3 +1616,36 @@ class LlamaForTokenClassification(LlamaPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+"""
+注释：
+以llama-7B为例，属于decoder-only models的范畴，只有decoder层。
+核心是包含了32层的decoder，每个decoder包含一个llamaAttention和llamaMLP
+
+LlamaForCausalLM(
+  (model): LlamaModel(
+    (embed_tokens): Embedding(32000, 4096, padding_idx=31999)
+    (layers): ModuleList(
+      (0-31): 32 x LlamaDecoderLayer(
+        (self_attn): LlamaAttention(
+          (q_proj): Linear(in_features=4096, out_features=4096, bias=False)
+          (k_proj): Linear(in_features=4096, out_features=4096, bias=False)
+          (v_proj): Linear(in_features=4096, out_features=4096, bias=False)
+          (o_proj): Linear(in_features=4096, out_features=4096, bias=False)
+          (rotary_emb): LlamaRotaryEmbedding()
+        )
+        (mlp): LlamaMLP(
+          (gate_proj): Linear(in_features=4096, out_features=11008, bias=False)
+          (down_proj): Linear(in_features=11008, out_features=4096, bias=False)
+          (up_proj): Linear(in_features=4096, out_features=11008, bias=False)
+          (act_fn): SiLUActivation()
+        )
+        (input_layernorm): LlamaRMSNorm()
+        (post_attention_layernorm): LlamaRMSNorm()
+      )
+    )
+    (norm): LlamaRMSNorm()
+  )
+  (lm_head): Linear(in_features=4096, out_features=32000, bias=False)
+)
+"""

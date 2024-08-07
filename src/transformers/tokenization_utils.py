@@ -91,6 +91,35 @@ class Trie:
         >>> trie.data
         {"H": {"e": {"l": {"l": {"o": {"": 1, " ": {"友": {"達": {"": 1}}}}}}}}}
         ```
+    eg:
+   {
+    "H":
+    {
+        "e":
+        {
+            "l":
+            {
+                "l":
+                {
+                    "o":
+                    {
+                        "": 1,
+                        " ":
+                        {
+                            "友":
+                            {
+                                "達":
+                                {
+                                    "": 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
         """
         if not word:
             # Prevent empty string
@@ -362,6 +391,7 @@ def _is_control(char):
 
 
 def _is_punctuation(char):
+    # punctuation characters: 标点符号
     """Checks whether `char` is a punctuation character."""
     cp = ord(char)
     # We treat all non-letter/number ASCII as punctuation.
