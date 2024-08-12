@@ -30,9 +30,9 @@ pkgs_to_check_at_runtime = [
     "packaging",
     "filelock",
     "numpy",
-    "tokenizers",
+    #"tokenizers", # 暂时屏蔽，因为tokenizers的版本要求比较严格
     "huggingface-hub",
-    "safetensors",
+    #"safetensors",
     "accelerate",
     "pyyaml",
 ]

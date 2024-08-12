@@ -96,7 +96,7 @@ class PretrainedConfig(PushToHubMixin):
             Whether the model is used as an encoder/decoder or not.
         is_decoder (`bool`, *optional*, defaults to `False`):
             Whether the model is used as decoder or not (in which case it's used as an encoder).
-        cross_attention_hidden_size** (`bool`, *optional*):
+        cross_attention_hidden_size** (`bool`, *optional*): # 交叉注意力encoder-decoder里才用到
             The hidden size of the cross-attention layer in case the model is used as a decoder in an encoder-decoder
             setting and the cross-attention hidden dimension differs from `self.config.hidden_size`.
         add_cross_attention (`bool`, *optional*, defaults to `False`):
@@ -138,7 +138,7 @@ class PretrainedConfig(PushToHubMixin):
         diversity_penalty (`float`, *optional*, defaults to 0.0):
             Value to control diversity for group beam search. that will be used by default in the `generate` method of
             the model. 0 means no diversity penalty. The higher the penalty, the more diverse are the outputs.
-        temperature (`float`, *optional*, defaults to 1.0):
+        temperature (`float`, *optional*, defaults to 1.0): score/temperature, 温度越高，softmax的分数越均匀，多样性增加，温度越低，softmax呈尖峰，稳定性增加
             The value used to module the next token probabilities that will be used by default in the `generate` method
             of the model. Must be strictly positive.
         top_k (`int`, *optional*, defaults to 50):
@@ -399,7 +399,7 @@ class PretrainedConfig(PushToHubMixin):
         return len(self.id2label)
 
     @num_labels.setter
-    def num_labels(self, num_labels: int):
+    def num_labels(self, num_labels: int): # 好处是可以直接写 config.num_labels=2
         if not hasattr(self, "id2label") or self.id2label is None or len(self.id2label) != num_labels:
             self.id2label = {i: f"LABEL_{i}" for i in range(num_labels)}
             self.label2id = dict(zip(self.id2label.values(), self.id2label.keys()))

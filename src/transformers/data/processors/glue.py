@@ -21,6 +21,8 @@ from dataclasses import asdict
 from enum import Enum
 from typing import List, Optional, Union
 
+# "from ..." 代表从根目录导入, 即${proj}/src/transformers.__init__.py下开始导入
+# "from ." 代表从当前目录导入
 from ...tokenization_utils import PreTrainedTokenizer
 from ...utils import is_tf_available, logging
 from .utils import DataProcessor, InputExample, InputFeatures

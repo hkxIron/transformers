@@ -307,6 +307,7 @@ def to_numpy(obj):
     return obj
 
 
+# output本质上都是一个Dict
 class ModelOutput(OrderedDict):
     """
     Base class for all model outputs as dataclass. Has a `__getitem__` that allows indexing by integer or slice (like a

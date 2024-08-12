@@ -18,7 +18,7 @@
 # to defer the actual importing for when the objects are requested. This way `import transformers` provides the names
 # in the namespace without actually importing anything (and especially none of the backends).
 
-__version__ = "4.44.0.dev0"
+__version__ = "4.44.0.dev0" # 原来__version__是这样来的
 
 from typing import TYPE_CHECKING
 

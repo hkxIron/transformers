@@ -26,6 +26,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+# "from ..."是代表从transformers这个根目录下开始引用
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, StaticCache
 from ...modeling_attn_mask_utils import AttentionMaskConverter
@@ -117,10 +118,18 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    """
+        rms_norm(x) = alpha * x/sqrt(mean(x^2))
+    """
     def forward(self, hidden_states):
+        # hidden_states:[batch, sequence_len, hidden_size]
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # var(x) = x^2
+        # 在最后hidden_size维度上求平均, 注意，rms_norm并没有去中心化操作
+        # var:[batch, sequence_len, 1]
+        variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
+        # rsqrt(x)=1/sqrt(x^2), 是对每个元素取平方根后再取倒数
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
@@ -277,18 +286,31 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+"""
+我已盏过图，的确如此
+SiLU 函数将输入值x乘以 sigmoid(x) 函数的输出，其效果是在正值上非饱和，
+负值上平滑并接近于零。与 ReLU 函数类似，SiLU 函数也能够创建非线性决策边界，
+但它允许一些信息（即使是负值）传递，而不是像 ReLU 那样将所有负值置为零，这种特性可以帮助减轻梯度消失问题。
+"""
 class LlamaMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config:LlamaConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
+        # gate_proj:[hidden_size, intermediate_size]
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        # up_proj:[hidden_size, intermediate_size]
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        # down_proj:[intermediate_size, hidden_size]
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        # llama中用的是silu
+        # silu(x) = x * sigmoid(x)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def forward(self, x:torch.Tensor):
+        # x:[batch, seq_len, hidden_size]
+        # 张量并行：tensor parallel
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
@@ -306,8 +328,10 @@ class LlamaMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
+            # y = down( gate(x) * up(x) )
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
+        # down_proj:[batch, seq_len, hidden_size]
         return down_proj
 
 
@@ -680,7 +704,7 @@ class LlamaSdpaAttention(LlamaAttention):
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
     "flash_attention_2": LlamaFlashAttention2,
-    "sdpa": LlamaSdpaAttention,
+    "sdpa": LlamaSdpaAttention, # scaled_dot_product_attention
 }
 
 
@@ -698,8 +722,8 @@ class LlamaDecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor, # [batch, seq_len, embed_dim]
+        attention_mask: Optional[torch.Tensor] = None, # casual_mask:[batch, 1, query_seq_len, key_seq_len]
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
@@ -712,7 +736,7 @@ class LlamaDecoderLayer(nn.Module):
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
             attention_mask (`torch.FloatTensor`, *optional*):
-                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
+                casual attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
                 query_sequence_length, key_sequence_length)` if default attention is used.
             output_attentions (`bool`, *optional*):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
@@ -730,13 +754,14 @@ class LlamaDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
+        # hiddens_states: [batch, seq_len, hidden_size]
         residual = hidden_states
 
-        # 1. Self Attention: pre_norm + self_attention + residual
-        # 1.1 layer norm
-        hidden_states = self.input_layernorm(hidden_states)
+        # T1. Self Attention: [[pre_norm + self_attention + residual]]
+        # T1.1 layer norm
+        hidden_states = self.input_layernorm(hidden_states) # [batch, seq_len, hidden_size]
 
-        # 1.2 Casual Masked Self Attention(因果attention)
+        # T1.2 Casual Masked Self Attention(因果attention)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -745,19 +770,22 @@ class LlamaDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            position_embeddings=position_embeddings,
+            position_embeddings=position_embeddings, # rope旋转位置编码
             **kwargs,
         )
 
-        # 1.3 Add
+        # T1.3 Add
+        # residual:[batch, seq_len, hidden_size]
+        # hidden_states:[batch, seq_len, hidden_size]
         hidden_states = residual + hidden_states
 
-        # 2. Fully Connected: pre_norm + mlp + residual
+        # T2. Fully Connected: [[pre_norm + mlp + residual]]
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
+        # hidden_states:[batch, seq_len, hidden_size]
         outputs = (hidden_states,)
 
         if output_attentions:
@@ -765,7 +793,7 @@ class LlamaDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
-
+        # 注意：outputs是个tuple,第0个元素是hidden_states,为啥不用OrderedDict?
         return outputs
 
 
@@ -791,7 +819,7 @@ LLAMA_START_DOCSTRING = r"""
     LLAMA_START_DOCSTRING,
 )
 class LlamaPreTrainedModel(PreTrainedModel):
-    config_class = LlamaConfig
+    config_class = LlamaConfig # 写在这里就是self.config_class
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["LlamaDecoderLayer"]
@@ -856,7 +884,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
 
             Two formats are allowed:
             - a [`~cache_utils.Cache`] instance;
-            - Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
+            - Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors(key+value) of
             shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`). This is also known as the legacy
             cache format.
 
@@ -879,10 +907,10 @@ LLAMA_INPUTS_DOCSTRING = r"""
         output_hidden_states (`bool`, *optional*):
             Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
             more detail.
-        return_dict (`bool`, *optional*):
+        return_dict (`bool`, *optional*): 是否返回OrderDict
             Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-            Indices depicting the position of the input sequence tokens in the sequence. Contrarily to `position_ids`,
+            Indices depicting the position of the input sequence tokens in the sequence. Contrarily(反之) to `position_ids`,
             this tensor is not affected by padding. It is used to update the cache in the correct position and to infer
             the complete sequence length.
 """
@@ -904,8 +932,9 @@ class LlamaModel(LlamaPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # 注意：padding_id的embedding不会被更新
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
+        # 多层decoder layer
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -925,16 +954,16 @@ class LlamaModel(LlamaPreTrainedModel):
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor = None, # [batch_size, sequence_length]
+        attention_mask: Optional[torch.Tensor] = None,# [batch_size, sequence_length],同一batch内不同序列需要padding,1代表非padding的地方,0代表padding的地方,padding不参与attention
+        position_ids: Optional[torch.LongTensor] = None, # [batch_size, sequence_length]
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None, # [sequence_length]
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -943,7 +972,7 @@ class LlamaModel(LlamaPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
+        if (input_ids is None) ^ (inputs_embeds is not None): # 异或, 两个值相异时才为true
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
@@ -954,7 +983,9 @@ class LlamaModel(LlamaPreTrainedModel):
             )
             use_cache = False
 
+        # T1. embedding
         if inputs_embeds is None:
+            # [batch, sequence_length, hidden_size]
             inputs_embeds = self.embed_tokens(input_ids)
 
         return_legacy_cache = False
@@ -979,9 +1010,13 @@ class LlamaModel(LlamaPreTrainedModel):
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
+        # inputs_embeds/hidden_states: [batch, sequence_length, hidden_size]
         hidden_states = inputs_embeds
 
+        # 注意：旋转位置编码在各decoder层之间共享，只需要计算一次
         # create position embeddings to be shared across the decoder layers
+        # position_ids: [batch_size, sequence_length]
+        # position_embeddings: [batch, sequence_length, hidden_size]
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
@@ -989,14 +1024,15 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
+        # T2: 多层 decoder
         for decoder_layer in self.layers:
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                all_hidden_states += (hidden_states,) # 将新的hidden_state追加
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
-                    hidden_states,
+                    hidden_states, # 上一层decoder的输出
                     causal_mask,
                     position_ids,
                     past_key_values,
@@ -1016,15 +1052,17 @@ class LlamaModel(LlamaPreTrainedModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
-
+            # 注意：outputs是个tuple,第0个元素是hidden_states,第1个元素为attn_score
             hidden_states = layer_outputs[0]
-
+            # 用这样的判断，为啥不用OrderedDict?
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        # T3. rms norm
+        # hidden_states: [batch, sequence_length, hidden_size]
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -1038,10 +1076,10 @@ class LlamaModel(LlamaPreTrainedModel):
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
+            last_hidden_state=hidden_states, # [batch, sequence_length, hidden_size]
+            past_key_values=next_cache, # key, value的shape均为(batch_size, num_heads, sequence_length, embed_size_per_head)
+            hidden_states=all_hidden_states, # 共layer层，每层shape:(batch_size, sequence_length, hidden_size
+            attentions=all_self_attns, # 共layer层，每层shape (batch_size, num_heads, sequence_length, sequence_length)
         )
 
     def _update_causal_mask(
@@ -1327,6 +1365,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     """,
     LLAMA_START_DOCSTRING,
 )
+# LLamaForSequenceClassification只是在LlamaModel中添加了mlp用于分类
 class LlamaForSequenceClassification(LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1442,6 +1481,7 @@ SQuAD (a linear layer on top of the hidden-states output to compute `span start 
     """,
     LLAMA_START_DOCSTRING,
 )
+# 在llamaModel上加了一个mlp头，用来预测答案在QUERY中的开始位置(start)与结束位置(end)
 class LlamaForQuestionAnswering(LlamaPreTrainedModel):
     base_model_prefix = "transformer"
 
@@ -1517,12 +1557,13 @@ class LlamaForQuestionAnswering(LlamaPreTrainedModel):
             end_positions = end_positions.clamp(0, ignored_index)
 
             loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            # 分别计算开始与结束位置的cross_entropy_loss,然后平均
             start_loss = loss_fct(start_logits, start_positions)
             end_loss = loss_fct(end_logits, end_positions)
             total_loss = (start_loss + end_loss) / 2
 
         if not return_dict:
-            output = (start_logits, end_logits) + outputs[2:]
+            output = (start_logits, end_logits) + outputs[2:] # +代表tuple相连
             return ((total_loss,) + output) if total_loss is not None else output
 
         return QuestionAnsweringModelOutput(
@@ -1541,6 +1582,8 @@ class LlamaForQuestionAnswering(LlamaPreTrainedModel):
     """,
     LLAMA_START_DOCSTRING,
 )
+# LlamaForTokenClassification只是在LlamaModel中添加了mlp用于分类
+# 与 LlamaForSequenceClassification的区别在于
 class LlamaForTokenClassification(LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)

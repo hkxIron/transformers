@@ -1302,7 +1302,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
           models, `pixel_values` for vision models and `input_values` for speech models).
     """
 
-    config_class = None
+    config_class = None # 写在这里就是self.config_class
     base_model_prefix = ""
     main_input_name = "input_ids"
     model_tags = None
