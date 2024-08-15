@@ -299,6 +299,7 @@ class LlamaMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         # gate_proj:[hidden_size, intermediate_size]
+        # 其weight为：[hidden_size, intermediate_size].T
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         # up_proj:[hidden_size, intermediate_size]
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
@@ -306,54 +307,85 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         # llama中用的是silu
         # silu(x) = x * sigmoid(x)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = ACT2FN[config.hidden_act] # silu
 
     def forward(self, x:torch.Tensor):
         # x:[batch, seq_len, hidden_size]
         # 张量并行：tensor parallel
         if self.config.pretraining_tp > 1:
+            # 将intermediate切成多份
             slice = self.intermediate_size // self.config.pretraining_tp
+            # 权重按行拆分为pretraining_tp份，每份行数为slice
+            # gate_proj.weight:[hidden_size, intermediate_size].T
+            # gate_proj_slices:([slice, hidden_size],...), 个数为tp_num
+            # up_proj.weight:[hidden_size, intermediate_size].T
+            # up_proj_slices:([slice, hidden_size]...),个数为tp_num
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
             up_proj_slices = self.up_proj.weight.split(slice, dim=0)
+
+            # down_proj.weight:[intermediate_size, hidden_size].T
+            # down_proj_slices:([hidden_size, slice], ...),共有tp_num个
             down_proj_slices = self.down_proj.weight.split(slice, dim=1)
 
-            gate_proj = torch.cat(
-                [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
-            )
+            # x:[batch, seq_len, hidden_size]
+            # gate_proj_slices:([slice, hidden_size],...), 个数为tp_num
+            # F.linear(x, w) = x*(w.T)
+            # 矩阵分块相乘后再concat,每块内数据X*W:[batch, seq_len, slice], 共有tp_num个
+            # concat后：[batch, seq_len, intermediate_size=slice*tp_num]
+            gate_proj = torch.cat([F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
+            # up_proj_slices:([slice, hidden_size]...),个数为tp_num
+            # 矩阵分块后concat后：[batch, seq_len, intermediate_size=slice*tp_num]
             up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
 
+            # gate_proj：[batch, seq_len, intermediate_size=slice*tp_num]
+            # up_proj:[batch, seq_len, intermediate_size=slice*tp_num]
+            # intermediate_states:([batch, seq_len, slice], ...),个数为:tp_num
             intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
-            ]
+            # tp_num*slice = intermediate_size
+            # 矩阵分块相乘,每块内数据X*(W.T),共tp_num个:
+            #   intermediate_state:[batch, seq_len, slice]
+            #   down_proj_slices:[hidden_size, slice]
+            # down_proj:[batch, seq_len, hidden_size], 共tp_num个
+            down_proj = [F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)]
+            # down_proj:[batch, seq_len, hidden_size], 将各张量结果相加, 得到最终矩阵相乘结果
             down_proj = sum(down_proj)
         else:
-            # y = down( gate(x) * up(x) )
+            # 注意：现在是gate后加激活函数，up里面没有
+            # y = down( silu(gate(x)) * up(x) )
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         # down_proj:[batch, seq_len, hidden_size]
         return down_proj
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    num_key_value_heads, seq_len, head_dim) to (batch, num_attention_heads, seq_len, head_dim)
     """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    if repeats == 1: # group大小为1,是MHA,无需复制
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    # torch.repeat_interleave不能升维
+    # None代表插入一维，作用等同于hidden_states.unsqueeze(dim=2)一样
+    # hidden_states: [batch, num_key_value_heads,  seq_len, head_dim]
+    # => [batch, num_key_value_heads, 1, seq_len, head_dim]
+    # => [batch, num_key_value_heads, repeats, seq_len, head_dim]
+    """
+    expand()函数可以将张量广播到新的形状。 注意：只能对维度值为1的维度进行扩展，无需扩展的维度，维度值不变，对应位置可写上原始维度大小或直接写作-1；且扩展的Tensor不会分配新的内存，只是原来的基础上创建新的视图并返回，返回的张量内存是不连续的。类似于numpy中的broadcast_to函数的作用。如果希望张量内存连续，可以调用contiguous函数。
+    """
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, repeats, seq_len, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * repeats, seq_len, head_dim)
 
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
+    # 标准的多头注意力
 
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
-        self.layer_idx = layer_idx
+        self.layer_idx = layer_idx # 层的index
         if layer_idx is None:
             logger.warning_once(
                 f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
@@ -365,8 +397,11 @@ class LlamaAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        # num_key_value_heads=1时，为multi query attention(MQA), 即所有query共享一个key
+        # num_key_value_heads=num_attention_heads时，为原始的multi head attention(MHA)
+        # num_key_value_heads<num_attention_heads时，为group query attention(GQA), 每个group大小为num_key_value_group_size
+        self.num_key_value_heads = config.num_key_value_heads # 默认为num_attention_heads
+        self.num_key_value_group_size = self.num_heads // self.num_key_value_heads # 每个group size的大小
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         # 默认即为因果推断
@@ -377,8 +412,9 @@ class LlamaAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        # q_proj: [hidden_size, num_head*head_dim]
+        # q_proj: [hidden_size, hidden_size=num_head*head_dim]
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        # 如果是GQA,那么num_key_value_heads< num_heads,即key, value向量维度小于query
         # k_proj, v_proj: [hidden_size, num_key_value_head*head_dim]
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -400,8 +436,8 @@ class LlamaAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
 
+        batch_size, seq_len, hidden_size = hidden_states.size()
         if self.config.pretraining_tp > 1: # Tensor parallelism
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
@@ -420,13 +456,25 @@ class LlamaAttention(nn.Module):
             value_states = torch.cat(value_states, dim=-1)
 
         else:
+            # hidden_state:[batch_size, seq_len, hidden_size]
+            # q_proj: [hidden_size, hidden_size=num_head*head_dim]
+            # query_states: [batch_size, seq_len, hidden_size]
             query_states = self.q_proj(hidden_states)
+            # k_proj, v_proj: [hidden_size, num_key_value_head*head_dim], 对于MHA而言，hidden_size=num_key_value_head*head_dim
+            # hidden_state:[batch_size, seq_len, hidden_size]
+            # key_states, value_states: [batch_size, num_key_value_head*head_dim]
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # query_states: [batch_size, seq_len, hidden_size=num_head*head_dim]
+        # -> [batch_size, seq_len, num_head, head_dim]
+        # -> [batch_size, num_head, seq_len, head_dim]
+        query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # query_states, value_states: [batch_size, seq_len, num_key_value_heads*head_dim]
+        # -> [batch_size, seq_len, num_key_value_heads, head_dim]
+        # -> [batch_size, num_key_value_heads, seq_len, head_dim]
+        key_states = key_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -438,6 +486,8 @@ class LlamaAttention(nn.Module):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
+
+        # query_states, value_states: [batch_size, num_key_value_heads, seq_len, head_dim]
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
@@ -445,40 +495,62 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # 如果是GQA,那么num_key_value_heads< num_heads,即key, value向量维度小于query
+        # 因此，GQA中需要进行key/value复制,以适合query的大小
+        # 所以，GQA并没有减少attention时的计算量，只是减少了key/value proj时的mlp计算量而己
+        # key_states, value_states: [batch_size, num_key_value_heads, seq_len, head_dim]
+        # -> [batch_size, num_heads, seq_len, head_dim]
+        key_states = repeat_kv(key_states, self.num_key_value_group_size)
+        value_states = repeat_kv(value_states, self.num_key_value_group_size)
 
+        # query_states, key_states: [batch_size, num_heads, seq_len, head_dim]
+        # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
+        # attention_mask: [batch, 1, query_seq_len, key_seq_len]
         if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]] # mask=0的地方为很大的负值
             attn_weights = attn_weights + causal_mask
+            # 有的实现中是直接给0所在的位置一个非常大的负数，以至于在经过softmax后为会0分
+            #attn_weights = attn_weights.masked_fill(casual_mask == 0, value=-1e9)
 
-        # upcast attention to fp32
+        # upcast attention to fp32,以防softmax计算exp溢出
+        # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # 现在强制dropout
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training) # 注意：现在attn_weight之后会有一个dropout
+        # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
+        # value_states: [batch_size, num_heads, value_seq_len, head_dim]
+        # attn_output: [batch_size, num_heads, query_seq_len, head_dim]
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        if attn_output.size() != (batch_size, self.num_heads, seq_len, self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f"`attn_output` should be of size {(batch_size, self.num_heads, seq_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
 
+        # attn_output: [batch_size, num_heads, query_seq_len, head_dim]
+        # -> [batch_size, query_seq_len, num_heads, head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+        # -> [batch_size, query_seq_len, num_heads*head_dim = hidden_size]
+        attn_output = attn_output.reshape(batch_size, seq_len, -1)
 
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
+            # 记住：最后还有一次proj
+            # q_proj: [hidden_size, hidden_size]
+            # attn_output: [batch_size, query_seq_len, hidden_size]
             attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
 
+        # attn_output: [batch_size, query_seq_len, hidden_size]
+        # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
         return attn_output, attn_weights, past_key_value
 
 
@@ -666,8 +738,8 @@ class LlamaSdpaAttention(LlamaAttention):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        key_states = repeat_kv(key_states, self.num_key_value_group_size)
+        value_states = repeat_kv(value_states, self.num_key_value_group_size)
 
         causal_mask = attention_mask
         if attention_mask is not None:
@@ -757,7 +829,7 @@ class LlamaDecoderLayer(nn.Module):
         # hiddens_states: [batch, seq_len, hidden_size]
         residual = hidden_states
 
-        # T1. Self Attention: [[pre_norm + self_attention + residual]]
+        # T1. Self Attention: [[pre_norm + self_attention + add]]
         # T1.1 layer norm
         hidden_states = self.input_layernorm(hidden_states) # [batch, seq_len, hidden_size]
 
@@ -779,7 +851,7 @@ class LlamaDecoderLayer(nn.Module):
         # hidden_states:[batch, seq_len, hidden_size]
         hidden_states = residual + hidden_states
 
-        # T2. Fully Connected: [[pre_norm + mlp + residual]]
+        # T2. Fully Connected: [[pre_norm + mlp + add]]
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
