@@ -3353,6 +3353,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
 
             kwarg_attn_imp = kwargs.pop("attn_implementation", None)
             if kwarg_attn_imp is not None:
+                # propery set
                 config._attn_implementation = kwarg_attn_imp
 
             model_kwargs = kwargs

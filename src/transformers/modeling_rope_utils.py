@@ -53,8 +53,8 @@ def _compute_default_rope_parameters(
             f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
         )
     if len(rope_kwargs) > 0:
-        base = rope_kwargs["base"]
-        dim = rope_kwargs["dim"]
+        base = rope_kwargs["base"] # 原始论文为：base=10000, 10000^(-2*index/head_dim)
+        dim = rope_kwargs["dim"] # dim一般为MHA中的head_dim
     elif config is not None:
         base = config.rope_theta
         partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
@@ -63,6 +63,11 @@ def _compute_default_rope_parameters(
     attention_factor = 1.0  # Unused in this type of RoPE
 
     # Compute the inverse frequencies
+    # base=10000
+    # 计算词向量元素两两分组之后，每组元素对应的旋转角度
+    # inv_freq shape: [dim / 2], 其值为: 1 / 10000 ^ (2 * dim_index / dim)
+    # 当 dim_index=0时，inv_freq=1
+    # 当 dim_index=dim时，inv_freq=1/10000
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
     return inv_freq, attention_factor
 

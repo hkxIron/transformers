@@ -1,5 +1,7 @@
 # 直接从根目录引入
 #from ...models.llama import LlamaModel
+from transformers.modeling_outputs import BaseModelOutputWithPast
+
 from transformers.models.llama import LlamaModel, LlamaConfig
 import torch
 import sys
@@ -12,14 +14,14 @@ def test_llama_forward():
         intermediate_size=11008//scale,
         num_hidden_layers=32//scale,
         num_attention_heads=32//scale,
+        attn_implementation='eager' # 默认的attention方式, hkx加入
     )
     print(f"config:\n{llama_config}")
     llama_model = LlamaModel(config=llama_config)
     batch,seq_len=2, 3 
     input_ids = torch.randint(low=0, high= llama_config.vocab_size, size=(batch, seq_len))
-    res = llama_model(input_ids)
-    print("res shape:", type(res))
-    print(res.last_hidden_state.shape)# torch.Size([2, 3, 2048])
+    model_out: BaseModelOutputWithPast = llama_model(input_ids)
+    print("model_out shape:", model_out.last_hidden_state.shape)# torch.Size([2, 3, 2048])
     """
     LlamaModel(
   (embed_tokens): Embedding(32000, 2048)

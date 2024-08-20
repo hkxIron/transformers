@@ -59,7 +59,7 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 def _prepare_4d_causal_attention_mask_with_cache_position(
     attention_mask: torch.Tensor,
     sequence_length: int,
-    target_length: int,
+    target_length: int, # target_length=past_seen_token + seq_len+1
     dtype: torch.dtype,
     device: torch.device,
     min_dtype: float,
@@ -92,10 +92,16 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
         causal_mask = attention_mask
     else:
+        # attention_mask:None
+        # target_length=past_seen_token + seq_len+1
+        # casual_mask:[sequence_length, target_length]
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
         if sequence_length != 1:
-            causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask = torch.triu(causal_mask, diagonal=1) # 只保留上三角(upper)矩阵, 下三角全置0, diagonal=1使用主对角线上面第1条对角线
+        # casual_mask: [sequence_length, target_length=seq_len+1]
         causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+        # casual_mask: [sequence_length, target_length=seq_len+1]
+        # -> [batch, 1, sequence_length, target_length=seq_len+1]
         causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
         if attention_mask is not None:
             causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
@@ -105,7 +111,7 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
             causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                 padding_mask, min_dtype
             )
-
+    # casual_mask: [batch, 1, sequence_length, target_length=seq_len+1]
     return causal_mask
 
 
@@ -166,7 +172,7 @@ class LlamaRotaryEmbedding(nn.Module):
                 "base": base,
                 "max_position_embeddings": max_position_embeddings,
             }
-            self.rope_type = rope_type
+            self.rope_type = rope_type # llama的rope_type是'default'
             self.max_seq_len_cached = max_position_embeddings
             self.original_max_seq_len = max_position_embeddings
         else:
@@ -181,8 +187,9 @@ class LlamaRotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
+        # inv_freq shape: [dim / 2], 其值为: 1 / 10000 ^ (2 * dim_index / dim)
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("inv_freq", inv_freq, persistent=False) # buffer就是常量，不会计算梯度
         self.original_inv_freq = self.inv_freq
 
     def _dynamic_frequency_update(self, position_ids, device):
@@ -203,25 +210,93 @@ class LlamaRotaryEmbedding(nn.Module):
             self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
             self.max_seq_len_cached = self.original_max_seq_len
 
-    @torch.no_grad()
+    @torch.no_grad() # 注意：这里是no_grad
     def forward(self, x, position_ids):
+        # x: [batch_size, num_key_value_heads, seq_len, head_dim], x为query或key
+        # position_ids: [batch_size, sequence_length]
+
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
 
+
         # Core RoPE block
+        # position_ids: [batch, sequence_length]
+        # inv_freq shape: [dim / 2], 其值为: 1 / 10000 ^ (2 * dim_index / dim)
+        # => [1, dim/2, 1],其中dim=head_dim
+        # inv_freq_expand:[batch, dim/2, 1], expand只适用于复制维度为1的
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+
+        # position_ids: [batch_size, sequence_length]
+        # position_ids_expanded: [batch, 1, sequence_length]
         position_ids_expanded = position_ids[:, None, :].float()
         # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
+            # inv_freq_expand:[batch, dim/2, 1], 其值为: 1 / 10000 ^ (2 * dim_index / dim)
+            # position_ids_expanded: [batch, 1, seq_len],
+            # freqs: [batch, dim/2, seq_len]
+            #     => [batch, seq_len, dim/2]
+            # 即公式里的：pos / (10000^(2*i/dim)), position_embed(m) = e^(j*m*theta) = e^(j*m/[10000^(2i/dim)]),其中j为虚数单位
+            """
+            freqs: 在最后一维dim维
+            [batch, seq_len, dim]
+            示例数据： 
+            [batch, seq_len=m, [m*theta0,
+                                m*theta1,
+                                m*theta2,
+                                ... 
+                                m*theta(head_dim//2-2),
+                                m*theta(head_dim//2-1)
+                                ]]
+            """
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            # emb: [batch, seq_len, dim]
             emb = torch.cat((freqs, freqs), dim=-1)
+            """
+            cos: 在最后一维dim维
+            [batch, seq_len, dim]
+            示例数据： 
+            [batch, seq_len=m, [
+                                cos(m*theta0),
+                                cos(m*theta1),
+                                cos(m*theta2),
+                                ...
+                                cos(m*theta(head_dim//2-2)),
+                                cos(m*theta(head_dim//2-1)),
+                                ---------- 
+                                cos(m*theta0),
+                                cos(m*theta1),
+                                cos(m*theta2),
+                                ...
+                                cos(m*theta(head_dim//2-2)),
+                                cos(m*theta(head_dim//2-1))
+                                ]]
+                                
+            sin: 在最后一维dim维
+            [batch, seq_len, dim]
+            示例数据： 
+            [batch, seq_len=m, [
+                                sin(m*theta0),
+                                sin(m*theta1),
+                                sin(m*theta2),
+                                ...
+                                sin(m*theta(head_dim//2-2)),
+                                sin(m*theta(head_dim//2-1)),
+                                ---------- 
+                                sin(m*theta0),
+                                sin(m*theta1),
+                                sin(m*theta2),
+                                ...
+                                sin(m*theta(head_dim//2-2)),
+                                sin(m*theta(head_dim//2-1)),
+                                ]]
+            """
             cos = emb.cos()
             sin = emb.sin()
 
         # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
-        cos = cos * self.attention_scaling
+        cos = cos * self.attention_scaling # attention_scaling默认为1
         sin = sin * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
@@ -254,9 +329,26 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    # x: [batch, num_head, seq_len, head_dim]
+    x1 = x[..., : x.shape[-1] // 2] # 前半部分
+    x2 = x[..., x.shape[-1] // 2 :] # 后半部分
+    """
+    x.shape: [batch, num_head, seq_len, head_dim]
+    [batch=0, num_head=0, seq_len=0, head_dim= [ -x(dim/2+1),
+                                                 -x(dim/2+2),
+                                                 -x(dim/2+3),
+                                                  ...,
+                                                  -x(dim),
+                                                  ----
+                                                  x0,
+                                                  x1,
+                                                  x2,
+                                                  ...,
+                                                  x(dim/2)
+                                                ]
+    ]    
+    """
+    return torch.cat((-x2, x1), dim=-1) # 注意：这里将x2取反了
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -279,8 +371,121 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+
+    """
+    cos: 在最后一维dim维
+    [batch, seq_len, dim]
+    示例数据： 
+    [batch, seq_len=m, [
+                        cos(m*theta0),
+                        cos(m*theta1),
+                        cos(m*theta2),
+                        ...
+                        cos(m*theta(head_dim//2-2)),
+                        cos(m*theta(head_dim//2-1)),
+                        ---------- 
+                        cos(m*theta0),
+                        cos(m*theta1),
+                        cos(m*theta2),
+                        ...
+                        cos(m*theta(head_dim//2-2)),
+                        cos(m*theta(head_dim//2-1))
+                        ]]
+    """
+    # cos, sin: [batch, seq_len, head_dim]
+    # =>   [batch, num_head=1, seq_len, head_dim]
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
+    # q: [batch, num_head, seq_len, head_dim]
+    # k: [batch, num_key_value_heads, seq_len, head_dim]
+    """
+   
+    q:
+    [batch==0, num_head==0, seq_len==0, head_dim= [ 
+                                                 q0,
+                                                 q1,
+                                                 q2,
+                                                 ...,
+                                                 q(dim/2)
+                                                 ----------
+                                                 q(dim/2+1),
+                                                 q(dim/2+2),
+                                                 q(dim/2+3),
+                                                  ...,
+                                                 q(dim-1)
+                                                ]
+     
+    cos: [batch, num_head=1, seq_len, dim]
+    示例数据： 
+    [batch, num_head=1, seq_len=m,dim=[
+                        cos(m*theta0),
+                        cos(m*theta1),
+                        cos(m*theta2),
+                        ...
+                        cos(m*theta(head_dim//2-2)),
+                        cos(m*theta(head_dim//2-1)),
+                        ---------- 注意：后半部分与前半部分相同
+                        cos(m*theta0),
+                        cos(m*theta1),
+                        cos(m*theta2),
+                        ...
+                        cos(m*theta(head_dim//2-2)),
+                        cos(m*theta(head_dim//2-1))
+                        ]]
+    ]    
+    
+    rotate_half(q): 
+    [batch==0, num_head==0, seq_len==0, head_dim= [ -q(dim/2+1),
+                                                 -q(dim/2+2),
+                                                 -q(dim/2+3),
+                                                  ...,
+                                                  -q(dim-1),
+                                                  ----
+                                                  q0,
+                                                  q1,
+                                                  q2,
+                                                  ...,
+                                                  q(dim/2)
+                                                ]
+    
+    sin: [batch,num_head=1, seq_len, dim]
+    示例数据： 
+    [batch, num_head=1, seq_len==m,dim=[
+                        sin(m*theta0),
+                        sin(m*theta1),
+                        sin(m*theta2),
+                        ...
+                        sin(m*theta(head_dim//2-2)),
+                        sin(m*theta(head_dim//2-1)),
+                        ---------- 注意：后半部分与前半部分相同
+                        sin(m*theta0),
+                        sin(m*theta1),
+                        sin(m*theta2),
+                        ...
+                        sin(m*theta(head_dim//2-2)),
+                        sin(m*theta(head_dim//2-1))
+                        ]]
+                        
+    因此，最终q_embed:
+    [batch==0, num_head==0, seq_len==0, head_dim= [ 
+                                                     q0*cos(m*theta0)-q(dim/2+1)*sin(m*theta0),
+                                                     q1*cos(m*theta1)-q(dim/2+2)*sin(m*theta1),
+                                                     q2*cos(m*theta2)-q(dim/2+3)*sin(m*theta2),
+                                                     ...,
+                                                     q(dim/2)*cos(m*theta(dim/2))-q(dim-1)*sin(m*theta(dim/2)),
+                                                     ----------
+                                                     q(dim/2+1)*cos(m*theta0)+q0*sin(m*theta0),
+                                                     q(dim/2+2)*cos(m*theta1)+q1*sin(m*theta1),
+                                                     q(dim/2+3)*cos(m*theta2)+q2*sin(m*theta2),
+                                                     ...,
+                                                     q(dim-1)*cos(m*theta(dim/2))+q(dim/2)*sin(m*theta(dim/2))
+                                                    ]
+     
+    注意：这里q_embed与RoFormer中的RoPE 构造公式不同, 即RoFormer中是将相邻位置(q0,q1)作为复数的实部与虚部，而llama中是将(q0,q(d/2))作为复数的实部与虚部
+    RoFormer中的Rope
+    = [q0, q1, q2, ..., q(d-2), q(d-1)] .* [cos(m*theta0), cos(m*theta0), cos(m*theta1),cos(m*theta1), ..., cos(m*theta(head_dim/2)),cos(m*theta(head_dim/2))]  .*代表逐元素相乘
+    + [-q1,q0,-q3, ...,-q(d-1), q(d-2)] .* [sin(m*theta0), sin(m*theta0), sin(m*theta1),sin(m*theta1), ..., sin(m*theta(head_dim/2)),sin(m*theta(head_dim/2))]
+    """
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -328,7 +533,7 @@ class LlamaMLP(nn.Module):
             down_proj_slices = self.down_proj.weight.split(slice, dim=1)
 
             # x:[batch, seq_len, hidden_size]
-            # gate_proj_slices:([slice, hidden_size],...), 个数为tp_num
+            # gate_proj_slices:([slice, hidden_size],...), 个数为tp_num, 相当于Meta-llama源码中的ColumnParallelLinear按列分块,对w按列分块
             # F.linear(x, w) = x*(w.T)
             # 矩阵分块相乘后再concat,每块内数据X*W:[batch, seq_len, slice], 共有tp_num个
             # concat后：[batch, seq_len, intermediate_size=slice*tp_num]
@@ -401,7 +606,7 @@ class LlamaAttention(nn.Module):
         # num_key_value_heads=num_attention_heads时，为原始的multi head attention(MHA)
         # num_key_value_heads<num_attention_heads时，为group query attention(GQA), 每个group大小为num_key_value_group_size
         self.num_key_value_heads = config.num_key_value_heads # 默认为num_attention_heads
-        self.num_key_value_group_size = self.num_heads // self.num_key_value_heads # 每个group size的大小
+        self.num_key_value_group_size = self.num_heads // self.num_key_value_heads # 每个GQA中的group size的大小
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         # 默认即为因果推断
@@ -427,6 +632,7 @@ class LlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        # attention_mask是样本组成batch时指示非padding与padding部分, padding处mask=0, 非padding处mask=1
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -476,7 +682,10 @@ class LlamaAttention(nn.Module):
         key_states = key_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        # cos:[batch, seq_len, dim]
+        # sin:[batch, seq_len, dim]
         if position_embeddings is None:
+            # 如果位置编码为空，使用rope计算位置编码
             logger.warning_once(
                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
                 "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
@@ -487,7 +696,8 @@ class LlamaAttention(nn.Module):
         else:
             cos, sin = position_embeddings
 
-        # query_states, value_states: [batch_size, num_key_value_heads, seq_len, head_dim]
+        # query_states:[batch_size, num_head, seq_len, head_dim]
+        # key_states: [batch_size, num_key_value_heads, seq_len, head_dim]
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
@@ -509,7 +719,7 @@ class LlamaAttention(nn.Module):
 
         # attention_mask: [batch, 1, query_seq_len, key_seq_len]
         if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]] # mask=0的地方为很大的负值
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]] # 此处的mask是0与-inf,0的地方参与attention
             attn_weights = attn_weights + causal_mask
             # 有的实现中是直接给0所在的位置一个非常大的负数，以至于在经过softmax后为会0分
             #attn_weights = attn_weights.masked_fill(casual_mask == 0, value=-1e9)
@@ -517,7 +727,7 @@ class LlamaAttention(nn.Module):
         # upcast attention to fp32,以防softmax计算exp溢出
         # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # 现在强制dropout
+        # 现在强制dropout,但attention_dropout默认为0
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training) # 注意：现在attn_weight之后会有一个dropout
         # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
         # value_states: [batch_size, num_heads, value_seq_len, head_dim]
@@ -537,8 +747,12 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
 
         if self.config.pretraining_tp > 1:
+            # 张量并行, 矩阵相乘中的列式并行(分块相乘后相加)
+            # attn_output: ([batch_size, query_seq_len, hidden_size//tp_num],...), 共有tp_num个, 相当于Meta-llama源码中的ColumnParallelLinear按列分块
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+            # o_proj_slices: ([hidden_size, hidden_size//tp_num], ,,,) ,共有tp_num个
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            # attn_output: [batch_size, query_seq_len, hidden_size]
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
             # 记住：最后还有一次proj
@@ -731,6 +945,7 @@ class LlamaSdpaAttention(LlamaAttention):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
+
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
@@ -1037,10 +1252,10 @@ class LlamaModel(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None, # [sequence_length]
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions # False
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        ) # False
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1073,12 +1288,17 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
+            input_seq_len = inputs_embeds.shape[1]
+            # cache_position:[sequence_length]
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + input_seq_len, device=inputs_embeds.device)
         if position_ids is None:
+            # position_ids:[1, sequence_length]
             position_ids = cache_position.unsqueeze(0)
 
+        # 因果注意力mask,默认attention_mask传入为None
+        # attention_mask:None
+        # input_embeds:[batch, sequence_length, hidden_size]
+        # cache_position:[sequence_length]
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
@@ -1088,7 +1308,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # 注意：旋转位置编码在各decoder层之间共享，只需要计算一次
         # create position embeddings to be shared across the decoder layers
         # position_ids: [batch_size, sequence_length]
-        # position_embeddings: [batch, sequence_length, hidden_size]
+        # position_embeddings: ([1, sequence_length, hidden_size], ),元素个数为batch
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
@@ -1180,7 +1400,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
         if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
-            if AttentionMaskConverter._ignore_causal_mask_sdpa(
+            if AttentionMaskConverter._ignore_causal_mask_sdpa( # sdpa不需要attention_mask
                 attention_mask,
                 inputs_embeds=input_tensor,
                 past_key_values_length=past_seen_tokens,
@@ -1194,6 +1414,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if using_static_cache:
             target_length = past_key_values.get_max_length()
         else:
+            # target_length=past_seen_token+ seq_len+1
             target_length = (
                 attention_mask.shape[-1]
                 if isinstance(attention_mask, torch.Tensor)
@@ -1201,6 +1422,10 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        # attention_mask:None
+        # target_length=past_seen_token + seq_len+1
+        # cache_position:[sequence_len]
+        # input_tensor:[batch, sequence_len, hidden_size]
         causal_mask = _prepare_4d_causal_attention_mask_with_cache_position(
             attention_mask,
             sequence_length=sequence_length,
@@ -1218,6 +1443,7 @@ class LlamaModel(LlamaPreTrainedModel):
             and attention_mask.device.type == "cuda"
             and not output_attentions
         ):
+            # 不会进入
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
@@ -1307,7 +1533,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask, # 一般均为None
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,

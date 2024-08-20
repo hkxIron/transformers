@@ -417,7 +417,7 @@ class PretrainedConfig(PushToHubMixin):
             return "eager"
 
     @_attn_implementation.setter
-    def _attn_implementation(self, value):
+    def _attn_implementation(self, value:str):
         self._attn_implementation_internal = value
 
     def save_pretrained(self, save_directory: Union[str, os.PathLike], push_to_hub: bool = False, **kwargs):

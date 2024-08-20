@@ -198,7 +198,7 @@ class ClassInstantier(OrderedDict):
 
 
 ACT2CLS = {
-    "gelu": GELUActivation,
+    "gelu": GELUActivation, # gelu(x)=0.5*x*(1+tanh(sqrt(2/pai)*(x+0.044715*x^3)))
     "gelu_10": (ClippedGELUActivation, {"min": -10, "max": 10}),
     "gelu_fast": FastGELUActivation,
     "gelu_new": NewGELUActivation,
