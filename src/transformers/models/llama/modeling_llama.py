@@ -257,7 +257,7 @@ class LlamaRotaryEmbedding(nn.Module):
             cos: 在最后一维dim维
             [batch, seq_len, dim]
             示例数据： 
-            [batch, seq_len=m, [
+            [batch, seq_len==m, [
                                 cos(m*theta0),
                                 cos(m*theta1),
                                 cos(m*theta2),
@@ -274,7 +274,7 @@ class LlamaRotaryEmbedding(nn.Module):
                                 ]]
                                 
             sin: 在最后一维dim维
-            [batch, seq_len, dim]
+            [batch, seq_len==m, dim]
             示例数据： 
             [batch, seq_len=m, [
                                 sin(m*theta0),
@@ -417,7 +417,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
      
     cos: [batch, num_head=1, seq_len, dim]
     示例数据： 
-    [batch, num_head=1, seq_len=m,dim=[
+    [batch, num_head=1, seq_len==m,dim=[
                         cos(m*theta0),
                         cos(m*theta1),
                         cos(m*theta2),
@@ -483,8 +483,17 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
      
     注意：这里q_embed与RoFormer中的RoPE 构造公式不同, 即RoFormer中是将相邻位置(q0,q1)作为复数的实部与虚部，而llama中是将(q0,q(d/2))作为复数的实部与虚部
     RoFormer中的Rope
-    = [q0, q1, q2, ..., q(d-2), q(d-1)] .* [cos(m*theta0), cos(m*theta0), cos(m*theta1),cos(m*theta1), ..., cos(m*theta(head_dim/2)),cos(m*theta(head_dim/2))]  .*代表逐元素相乘
-    + [-q1,q0,-q3, ...,-q(d-1), q(d-2)] .* [sin(m*theta0), sin(m*theta0), sin(m*theta1),sin(m*theta1), ..., sin(m*theta(head_dim/2)),sin(m*theta(head_dim/2))]
+    = [q0, q1, q2, ..., q(d-2), q(d-1)] .* [cos(m*theta0), cos(m*theta0), cos(m*theta1),cos(m*theta1), ..., cos(m*theta(head_dim/2)),cos(m*theta(dim/2))]  .*代表逐元素相乘
+    + [-q1,q0,-q3, ...,-q(d-1), q(d-2)] .* [sin(m*theta0), sin(m*theta0), sin(m*theta1),sin(m*theta1), ..., sin(m*theta(head_dim/2)),sin(m*theta(dim/2))]
+    = [
+       q0*cos(m*theta0)-q1*sin(m*theta0),
+       q1*cost(m*theta0)+q0*sin(m*theta0),
+       q2*cos(m*theta1)-q3*sin(m*theta1),
+       q3*cost(m*theta1)+q2*sin(m*theta1),
+       ...
+      q(d-2)*cos(m*theta(dim/2))-q(d-1)*sin(m*theta(dim/2)),
+      q(d-1)*cos(m*theta(dim/2))-q(d-2)*sin(m*theta(dim/2))
+    ]
     """
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
