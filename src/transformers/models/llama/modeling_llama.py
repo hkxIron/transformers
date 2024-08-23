@@ -54,6 +54,7 @@ from .configuration_llama import LlamaConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
+print("hkx llama for debug")
 
 
 def _prepare_4d_causal_attention_mask_with_cache_position(
@@ -481,7 +482,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
                                                      q(dim-1)*cos(m*theta(dim/2))+q(dim/2)*sin(m*theta(dim/2))
                                                     ]
      
-    注意：这里q_embed与RoFormer中的RoPE 构造公式不同, 即RoFormer中是将相邻位置(q0,q1)作为复数的实部与虚部，而llama中是将(q0,q(d/2))作为复数的实部与虚部
+    注意：这里q_embed与RoFormer中的RoPE 构造公式不同, 即RoFormer中是将相邻位置(q0,q1)作为复数的实部与虚部，而hugging face中llama中是将(qi,q(i+d/2))分别作为复数的实部与虚部,
+    meta实现的llama则与原RoFormer中的Rope保持一致
+    
     RoFormer中的Rope
     = [q0, q1, q2, ..., q(d-2), q(d-1)] .* [cos(m*theta0), cos(m*theta0), cos(m*theta1),cos(m*theta1), ..., cos(m*theta(head_dim/2)),cos(m*theta(dim/2))]  .*代表逐元素相乘
     + [-q1,q0,-q3, ...,-q(d-1), q(d-2)] .* [sin(m*theta0), sin(m*theta0), sin(m*theta1),sin(m*theta1), ..., sin(m*theta(head_dim/2)),sin(m*theta(dim/2))]

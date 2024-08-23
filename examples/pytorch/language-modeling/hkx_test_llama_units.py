@@ -1,10 +1,22 @@
-# 直接从根目录引入
 #from ...models.llama import LlamaModel
-from transformers.modeling_outputs import BaseModelOutputWithPast
+# 直接从根目录引入
+"""
+注意：debug本项目时需要将${PROJECT_ROOT}/src添加到sys.path中，即sys.path.insert(0, ${PROJECT_ROOT}/src)
+或者将${PROJECT_ROOT}/src设置为source root
+"""
+#import sys;sys.path.insert(0, "/home/hkx/data/work/open/transformers/src")
 
+import sys
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama import LlamaModel, LlamaConfig
 import torch
-import sys
+
+def show_paths():
+    import sys
+    import os
+    print("sys path", sys.path)
+    print("cur work path:", os.getcwd())
+
 
 def test_llama_forward():
     scale = 2
@@ -51,4 +63,5 @@ def test_llama_forward():
 
 if __name__ == "__main__":
     print("args:", sys.argv)
+    show_paths()
     test_llama_forward()
