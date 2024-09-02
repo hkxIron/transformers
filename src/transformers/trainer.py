@@ -1688,6 +1688,7 @@ class Trainer:
         if has_warning:
             logger.warning_once(warning_str)
 
+    # hkx_note:使用fsdp对model进行包装
     def _wrap_model(self, model, training=True, dataloader=None):
         if self.args.use_ipex:
             dtype = torch.bfloat16 if self.use_cpu_amp else torch.float32
@@ -1952,6 +1953,7 @@ class Trainer:
                 ignore_keys_for_eval=ignore_keys_for_eval,
             )
 
+    # hkx_note:模型训练，内部循环
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
@@ -2081,7 +2083,7 @@ class Trainer:
                 gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs
 
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
-
+        # hkx_note:对模型进行wrap
         model = self._wrap_model(self.model_wrapped)
 
         # as the model is wrapped, don't use `accelerator.prepare`
@@ -2286,6 +2288,7 @@ class Trainer:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
+                    # hkx_note:计算一次前向推理，获取loss
                     tr_loss_step = self.training_step(model, inputs)
 
                 if (
@@ -2327,6 +2330,8 @@ class Trainer:
                             _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
                         elif self.use_apex:
                             # Revert to normal clipping otherwise, handling Apex or full precision
+                            # 将所有的梯度进行模长原地(in-place)裁剪
+                            # 并将所有的参数的梯度整体看成一维向量，并计算p-范数，即所有元素平方之和再开方
                             _grad_norm = nn.utils.clip_grad_norm_(
                                 amp.master_params(self.optimizer),
                                 args.max_grad_norm,
@@ -2348,6 +2353,7 @@ class Trainer:
                         else:
                             grad_norm = _grad_norm
 
+                    # hkx_note: 优化器将梯度更新至参数中
                     self.optimizer.step()
 
                     self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
@@ -2358,11 +2364,12 @@ class Trainer:
                         if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                             self.lr_scheduler.step()
 
+                    # hkx_note: 优化器将梯度清0
                     model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-
+                    # hkx_note:记录grad_norm,用来检测是否出现梯度更新的异常值(过大)
                     self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
@@ -2383,6 +2390,7 @@ class Trainer:
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+            # 记录grad_norm
             self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
@@ -2799,6 +2807,7 @@ class Trainer:
             tr_loss -= tr_loss
 
             logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            # hkx_note:wandb中的记录的train/grad_norm
             if grad_norm is not None:
                 logs["grad_norm"] = grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             logs["learning_rate"] = self._get_learning_rate()
@@ -3318,13 +3327,14 @@ class Trainer:
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
-        model.train()
+        model.train() # 设成train mode
         inputs = self._prepare_inputs(inputs)
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
 
         with self.compute_loss_context_manager():
+            # hkx_note:计算loss
             loss = self.compute_loss(model, inputs)
 
         del inputs
@@ -3352,7 +3362,7 @@ class Trainer:
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-        if self.use_apex:
+        if self.use_apex: # 混合精度
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
@@ -3360,6 +3370,7 @@ class Trainer:
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
+    # hkx_note:计算loss
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
@@ -3673,6 +3684,7 @@ class Trainer:
         start_time = time.time()
 
         eval_loop = self.prediction_loop if self.args.use_legacy_prediction_loop else self.evaluation_loop
+        # hkx_note: 评估函数
         output = eval_loop(
             eval_dataloader,
             description="Evaluation",
@@ -3773,6 +3785,7 @@ class Trainer:
 
         return PredictionOutput(predictions=output.predictions, label_ids=output.label_ids, metrics=output.metrics)
 
+    # hkx_note: 评估函数
     def evaluation_loop(
         self,
         dataloader: DataLoader,
@@ -4080,6 +4093,7 @@ class Trainer:
                         logits_mb = raw_outputs
                     logits = smp_nested_concat(logits_mb)
             else:
+                # 有label计算loss
                 if has_labels or loss_without_labels:
                     with self.compute_loss_context_manager():
                         loss, outputs = self.compute_loss(model, inputs, return_outputs=True)

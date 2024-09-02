@@ -388,7 +388,7 @@ def get_grad_norm(params, scale=1):
     total_norm = 0.0
     for p in params:
         if p.grad is not None:
-            param_norm = (p.grad.detach().data / scale).norm(2)
+            param_norm = (p.grad.detach().data / scale).norm(p=2) # 2范数，就是平方之和再开根号
             total_norm += param_norm.item() ** 2
     total_norm = total_norm**0.5
     return total_norm

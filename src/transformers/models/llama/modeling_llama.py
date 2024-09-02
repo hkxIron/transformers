@@ -704,7 +704,7 @@ class LlamaAttention(nn.Module):
                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
                 "removed and `position_embeddings` will be mandatory."
             )
-            cos, sin = self.rotary_emb(value_states, position_ids)
+            cos, sin = self.rotary_emb.forward(value_states, position_ids)
         else:
             cos, sin = position_embeddings
 
@@ -954,7 +954,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
                 "removed and `position_embeddings` will be mandatory."
             )
-            cos, sin = self.rotary_emb(value_states, position_ids)
+            cos, sin = self.rotary_emb.forward(value_states, position_ids)
         else:
             cos, sin = position_embeddings
 

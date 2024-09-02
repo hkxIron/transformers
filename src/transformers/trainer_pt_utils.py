@@ -558,27 +558,35 @@ class LabelSmoother:
 
     def __call__(self, model_output, labels, shift_labels=False):
         logits = model_output["logits"] if isinstance(model_output, dict) else model_output[0]
+
         if shift_labels:
+            # logits:[batch, seq_len, vocab_size], index:0-(n-2)
             logits = logits[..., :-1, :].contiguous()
+            # logits:[batch, seq_len, vocab_size], index:1~(n-1)
             labels = labels[..., 1:].contiguous()
 
+        # log_probs:[batch, seq_len, vocab_size]
         log_probs = -nn.functional.log_softmax(logits, dim=-1)
         if labels.dim() == log_probs.dim() - 1:
             labels = labels.unsqueeze(-1)
 
-        padding_mask = labels.eq(self.ignore_index)
+        padding_mask = labels.eq(self.ignore_index) # 值为1与0, 1的地方为padding
         # In case the ignore_index is -100, the gather will fail, so we replace labels by 0. The padding_mask
         # will ignore them in any case.
+        # 将labels进行裁剪最大值与最小值
         labels = torch.clamp(labels, min=0)
-        nll_loss = log_probs.gather(dim=-1, index=labels)
+        # nll_loss:[batch, seq_len, vocab_size]
+        nll_loss = log_probs.gather(dim=-1, index=labels) # 将label_index所在处的loss收集起来即为negative log-likelihood loss
         # works for fp16 input tensor too, by internally upcasting it to fp32
+        # smoothed_loss:[batch, seq_len, 1], 所有token的总体loss之和
         smoothed_loss = log_probs.sum(dim=-1, keepdim=True, dtype=torch.float32)
 
+        # 将padding的地方loss置为0
         nll_loss.masked_fill_(padding_mask, 0.0)
         smoothed_loss.masked_fill_(padding_mask, 0.0)
 
         # Take the mean over the label dimensions, then divide by the number of active elements (i.e. not-padded):
-        num_active_elements = padding_mask.numel() - padding_mask.long().sum()
+        num_active_elements = padding_mask.numel() - padding_mask.long().sum() # 即有效的序列长度
         nll_loss = nll_loss.sum() / num_active_elements
         smoothed_loss = smoothed_loss.sum() / (num_active_elements * log_probs.shape[-1])
         return (1 - self.epsilon) * nll_loss + self.epsilon * smoothed_loss
