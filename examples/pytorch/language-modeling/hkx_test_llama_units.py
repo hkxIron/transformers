@@ -123,11 +123,11 @@ import torch.nn.functional as F
 def _init_weights(module:Module):
     # 这里面的init都没有用到xarviar或kaiming init?
     if isinstance(module, Linear):
-        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) # weight不能全为0
         if module.bias is not None:
             torch.nn.init.zeros_(module.bias)
     elif isinstance(module, Embedding):
-        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02) # embedding不能全为0
 
 class MyModel(torch.nn.Module):
     def __init__(self, *args, **kwargs) -> None:
@@ -143,21 +143,29 @@ class MyModel(torch.nn.Module):
 @my_decorator
 def test_grad_norm():
     model = MyModel()
-    batch = 5
-    dim=10
-    x, y = torch.randn((batch, dim)), torch.randint(low=0, high=10, size=(batch,))
-    logits = model(x)
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-    loss = F.cross_entropy(logits, y)
-    loss.backward()
-
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-1)
     print(model)
-    print([(x[0], x[1].shape) for x in model.named_parameters()])
-    print([(x[0], x[1].grad) for x in model.named_parameters()])
-    total_grad = utils.clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=2.0)
-    print("total_grad:", total_grad)
 
-    optimizer.step()
+    N = 20
+    batch=5
+    dim=10
+
+    x, y = torch.randn((N, dim)), torch.randint(low=0, high=10, size=(N,))
+    iter = 0
+    for epoch in range(100):
+        for ind in range(N // batch - 1):
+            optimizer.zero_grad()
+            logits = model(x[ind*batch:(ind+1)*batch,:])
+            loss = F.cross_entropy(logits, y[ind*batch:(ind+1)*batch])
+            loss.backward()
+
+            #print([(x[0], x[1].shape) for x in model.named_parameters()])
+            #print([(x[0], x[1].grad) for x in model.named_parameters()])
+            total_grad = utils.clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=2.0)
+            print(f"epoch:{epoch} iter:{iter} loss:{loss.item()} total_grad:{total_grad}")
+
+            optimizer.step()
+            iter+=1
 
 if __name__ == "__main__":
     print("args:", sys.argv)
