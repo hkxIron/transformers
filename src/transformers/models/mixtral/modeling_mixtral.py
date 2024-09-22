@@ -18,6 +18,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch Mixtral model."""
+"""
+继 Mistral 7B 之后，Mistral AI 在 2023 年 12 月发布了Mixtral 8x7B。
+Mixtral 8x7B 是一个采用稀疏混合专家机制即 Spars Mixture of Experts Model（SMoE）的大语言模型,它不仅具有高质量的效果,
+更重要的是其完全开放提供的预训练权重参数, 该模型采用 Apache 2.0 许可，这对开发者社区和后续研究都有很大价值。
+
+有趣的是，这个模型与 Mistral 7B 具有相同的 Transformer 架构，甚至代码库也是一样的， 仅仅在上层添加了少量实现稀疏混合专家机制即 SMoE 的代码。
+这一小修改却使模型效能有很大提升。白皮书中明确显示， Mixtral 8x7B 在各项基准测试中，表现优于或与 Llama 270B 和 GPT-3.5 相当。
+尤其在代码生成等任务上，Mixtra 8x7B 优势更为明显，远超 Llama 270B。同时 Mixtral 模型还可以微调成一个指令跟随模型，
+在 MT-Bench 上获得 8.3 分。
+
+作者：亚马逊云开发者
+链接：https://juejin.cn/post/7347504184067473443
+"""
 
 import math
 from typing import List, Optional, Tuple, Union

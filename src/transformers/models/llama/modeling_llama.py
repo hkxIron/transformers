@@ -1548,7 +1548,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs = self.model.forward(
             input_ids=input_ids,
             attention_mask=attention_mask, # 为在同一个batch中，不同sample的有效的input_ids所在的位置,1为有效id,0为padding位置
             position_ids=position_ids,
@@ -1572,16 +1572,20 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         loss = None
         if labels is not None:
+            # logits:[batch_size, sequence_length, vocab_size]
+            # labels:[batch_size, sequence_length]
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
+            # shift_logits:[batch_size*sequence_length, vocab_size]
+            # shift_labels:[batch_size*sequence_length]
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss = loss_fct.forward(shift_logits, shift_labels) # 默认是求batch*seq_len的loss的平均
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1730,7 +1734,9 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        # hidden_states:[batch, seq_len, hidden_size]
         hidden_states = transformer_outputs[0]
+        # logits:[batch, seq_len, num_labels]
         logits = self.score(hidden_states)
 
         if input_ids is not None:
@@ -1751,6 +1757,8 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             else:
                 sequence_lengths = -1
 
+        # logits:[batch, seq_len, num_labels]
+        # pooled_logits:[batch, 1, num_labels], 只取最后一个时间步的进行求loss
         pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
 
         loss = None
@@ -1764,6 +1772,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
                 else:
                     self.config.problem_type = "multi_label_classification"
 
+            # 对pooled后的logits求loss
             if self.config.problem_type == "regression":
                 loss_fct = MSELoss()
                 if self.num_labels == 1:
@@ -1771,10 +1780,10 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
                 else:
                     loss = loss_fct(pooled_logits, labels)
             elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
+                loss_fct = CrossEntropyLoss() # 单标签分类，如手写字体识别
                 loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
+                loss_fct = BCEWithLogitsLoss() # 多标签，为每个logits分类值后接一个sigmoid,而不是接softmax单标签
                 loss = loss_fct(pooled_logits, labels)
         if not return_dict:
             output = (pooled_logits,) + transformer_outputs[1:]
@@ -1796,7 +1805,7 @@ SQuAD (a linear layer on top of the hidden-states output to compute `span start 
     """,
     LLAMA_START_DOCSTRING,
 )
-# 在llamaModel上加了一个mlp头，用来预测答案在QUERY中的开始位置(start)与结束位置(end)
+# 在llamaModel上加了一个mlp头，用来预测答案在QUERY中的开始位置(start)与结束位置(end),即预测答案所在的SPAN
 class LlamaForQuestionAnswering(LlamaPreTrainedModel):
     base_model_prefix = "transformer"
 
@@ -1854,9 +1863,12 @@ class LlamaForQuestionAnswering(LlamaPreTrainedModel):
 
         sequence_output = outputs[0]
 
+        # logits:[batch, seq_len, 2]
         logits = self.qa_outputs(sequence_output)
+        # start_logits:[batch, seq_len, 1]
         start_logits, end_logits = logits.split(1, dim=-1)
         start_logits = start_logits.squeeze(-1).contiguous()
+        # end_logits:[batch, seq_len, 1]
         end_logits = end_logits.squeeze(-1).contiguous()
 
         total_loss = None
@@ -1898,7 +1910,8 @@ class LlamaForQuestionAnswering(LlamaPreTrainedModel):
     LLAMA_START_DOCSTRING,
 )
 # LlamaForTokenClassification只是在LlamaModel中添加了mlp用于分类
-# 与 LlamaForSequenceClassification的区别在于
+# 与 LlamaForSequenceClassification的区别在于前者是对于每个token都输出一个num_label的logits
+# 而后者只是输出一个pooled的logits
 class LlamaForTokenClassification(LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1955,8 +1968,10 @@ class LlamaForTokenClassification(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        # seq_output:[batch, seq_len, hidden_size]
         sequence_output = outputs[0]
         sequence_output = self.dropout(sequence_output)
+        # logits:[batch, seq_len, num_labels]
         logits = self.score(sequence_output)
 
         loss = None
