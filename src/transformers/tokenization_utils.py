@@ -585,7 +585,7 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
                 token.__setstate__({"special": True, "normalized": token.normalized})
             if token in self._added_tokens_decoder:
                 continue
-            if not token.special and token.normalized and getattr(self, "do_lower_case", False):
+            if (hasattr(token, "special") and not token.special) and token.normalized and getattr(self, "do_lower_case", False):
                 # Normalize if requested
                 token.content = token.content.lower()
             if token.content not in current_vocab:
@@ -595,7 +595,7 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
             else:
                 token_index = current_vocab[token.content]
 
-            if token.special and str(token) not in self.all_special_tokens:
+            if (hasattr(token, "special") and token.special) and str(token) not in self.all_special_tokens:
                 self._additional_special_tokens.append(token)
             # the setter automatically updates the reverse map
             self._added_tokens_decoder[token_index] = token
