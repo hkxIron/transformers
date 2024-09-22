@@ -93,9 +93,9 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
         causal_mask = attention_mask
     else:
-        # attention_mask:None
+        # attention_mask:[batch, sequence_length], 值为1的地方是有效token，为0的地方是padding_id
         # target_length=past_seen_token + seq_len+1
-        # casual_mask:[sequence_length, target_length]
+        # casual_mask:[sequence_length, target_length], casual_mask=0的地方是需要参与attention的地方
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
         if sequence_length != 1:
             causal_mask = torch.triu(causal_mask, diagonal=1) # 只保留上三角(upper)矩阵, 下三角全置0, diagonal=1使用主对角线上面第1条对角线
@@ -103,15 +103,20 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
         # casual_mask: [sequence_length, target_length=seq_len+1]
         # -> [batch, 1, sequence_length, target_length=seq_len+1]
-        causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-        if attention_mask is not None:
+        causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1) # expand会在该维度复制
+        if attention_mask is not None: # attention_mask:[batch, sequence_length]
             causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
             mask_length = attention_mask.shape[-1]
-            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+            # causal_mask:值为0的地方为需要attention的地方,值为-inf为不需要计算的地方
+            # attention_mask:值为0的地方为不需要计算的地方，值为1的地方为需要计算的地方
+            # 两者相加有如下几种情况：
+            # casual_mask(0)+attn_mask(0)=0, 不参与计算，需要额外mask
+            # casual_mask(0)+attn_mask(1)=1, 需要参与计算, 无需额外mask
+            # casual_mask(-inf)+attn_mask(0)=-inf, 不参与计算，无需额外mask
+            # casual_mask(-inf)+attn_mask(1)=-inf, 不参与计算，无需额外mask
+            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :] # attention_mask:[batch,1,1, sequence_length]
             padding_mask = padding_mask == 0
-            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                padding_mask, min_dtype
-            )
+            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(padding_mask, min_dtype)
     # casual_mask: [batch, 1, sequence_length, target_length=seq_len+1]
     return causal_mask
 
@@ -1307,8 +1312,8 @@ class LlamaModel(LlamaPreTrainedModel):
             # position_ids:[1, sequence_length]
             position_ids = cache_position.unsqueeze(0)
 
-        # 因果注意力mask,默认attention_mask传入为None
-        # attention_mask:None
+        # 因果注意力mask
+        # attention_mask: [batch, sequence_length], 为同一batch中不同样本的长效长度，为0的位置是padding
         # input_embeds:[batch, sequence_length, hidden_size]
         # cache_position:[sequence_length]
         causal_mask = self._update_causal_mask(
@@ -1388,7 +1393,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
     def _update_causal_mask(
         self,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor, # 注意对于batch_size>1, attention_mask一般不为空
         input_tensor: torch.Tensor,
         cache_position: torch.Tensor,
         past_key_values: Cache,
@@ -1545,7 +1550,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask, # 一般均为None
+            attention_mask=attention_mask, # 为在同一个batch中，不同sample的有效的input_ids所在的位置,1为有效id,0为padding位置
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
