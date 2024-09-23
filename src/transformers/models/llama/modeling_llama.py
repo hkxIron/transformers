@@ -1909,7 +1909,7 @@ class LlamaForQuestionAnswering(LlamaPreTrainedModel):
     """,
     LLAMA_START_DOCSTRING,
 )
-# LlamaForTokenClassification只是在LlamaModel中添加了mlp用于分类
+# LlamaForTokenClassification只是在LlamaModel中添加了mlp用于序列标注，比如常见的NER, slot_filling任务,对于每个位置都需要输出一个分类
 # 与 LlamaForSequenceClassification的区别在于前者是对于每个token都输出一个num_label的logits
 # 而后者只是输出一个pooled的logits
 class LlamaForTokenClassification(LlamaPreTrainedModel):
