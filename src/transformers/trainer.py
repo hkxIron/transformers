@@ -3311,6 +3311,8 @@ class Trainer:
 
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
+        hkx_note:计算forward loss
+
         Perform a training step on a batch of inputs.
 
         Subclass and override to inject custom behavior.
@@ -3381,6 +3383,7 @@ class Trainer:
             labels = inputs.pop("labels")
         else:
             labels = None
+        # hkx_note: 模型前向传播一次，以计算logits
         outputs = model(**inputs)
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
@@ -3394,6 +3397,7 @@ class Trainer:
             else:
                 model_name = unwrapped_model._get_name()
             if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                # 计算loss
                 loss = self.label_smoother(outputs, labels, shift_labels=True)
             else:
                 loss = self.label_smoother(outputs, labels)

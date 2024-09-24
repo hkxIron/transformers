@@ -251,7 +251,7 @@ def main():
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     # 发送遥测数据，有助于追踪示例的使用情况。
-    send_example_telemetry("run_clm", model_args, data_args)
+    # send_example_telemetry("run_clm", model_args, data_args)
 
     # Setup logging
     logging.basicConfig(

@@ -557,9 +557,11 @@ class LabelSmoother:
     ignore_index: int = -100
 
     def __call__(self, model_output, labels, shift_labels=False):
+        # hkx_note:计算cross_entory_loss
         logits = model_output["logits"] if isinstance(model_output, dict) else model_output[0]
 
         if shift_labels:
+            # 自回归模型，前面预测后面的token
             # logits:[batch, seq_len, vocab_size], index:0-(n-2)
             logits = logits[..., :-1, :].contiguous()
             # logits:[batch, seq_len, vocab_size], index:1~(n-1)
@@ -570,15 +572,16 @@ class LabelSmoother:
         if labels.dim() == log_probs.dim() - 1:
             labels = labels.unsqueeze(-1)
 
-        padding_mask = labels.eq(self.ignore_index) # 值为1与0, 1的地方为padding
+        padding_mask = labels.eq(self.ignore_index) # mask值为1与0, 1的地方为padding
         # In case the ignore_index is -100, the gather will fail, so we replace labels by 0. The padding_mask
         # will ignore them in any case.
+
         # 将labels进行裁剪最大值与最小值
         labels = torch.clamp(labels, min=0)
-        # nll_loss:[batch, seq_len, vocab_size]
+        # negative_log_likelihood_loss:[batch, seq_len, vocab_size], 就是cross_entropy_loss
         nll_loss = log_probs.gather(dim=-1, index=labels) # 将label_index所在处的loss收集起来即为negative log-likelihood loss
         # works for fp16 input tensor too, by internally upcasting it to fp32
-        # smoothed_loss:[batch, seq_len, 1], 所有token的总体loss之和
+        # smoothed_loss:[batch, seq_len, 1], 所有token的总体loss求和
         smoothed_loss = log_probs.sum(dim=-1, keepdim=True, dtype=torch.float32)
 
         # 将padding的地方loss置为0
@@ -587,8 +590,9 @@ class LabelSmoother:
 
         # Take the mean over the label dimensions, then divide by the number of active elements (i.e. not-padded):
         num_active_elements = padding_mask.numel() - padding_mask.long().sum() # 即有效的序列长度
-        nll_loss = nll_loss.sum() / num_active_elements
-        smoothed_loss = smoothed_loss.sum() / (num_active_elements * log_probs.shape[-1])
+        nll_loss = nll_loss.sum() / num_active_elements # 用有效的seq长度归一化
+        vocab_size = log_probs.shape[-1]
+        smoothed_loss = smoothed_loss.sum() / (num_active_elements * vocab_size) # 使用有效序列长度与vocab_size进行归一化,但并不知晓背后的动机
         return (1 - self.epsilon) * nll_loss + self.epsilon * smoothed_loss
 
 
