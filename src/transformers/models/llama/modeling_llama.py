@@ -709,6 +709,7 @@ class LlamaAttention(nn.Module):
                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
                 "removed and `position_embeddings` will be mandatory."
             )
+            # position_ids: [batch_size, sequence_length]
             cos, sin = self.rotary_emb.forward(value_states, position_ids)
         else:
             cos, sin = position_embeddings
@@ -1319,7 +1320,7 @@ class LlamaModel(LlamaPreTrainedModel):
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
-        # inputs_embeds/hidden_states: [batch, sequence_length, hidden_size]
+        # inputs_embeds, hidden_states: [batch, sequence_length, hidden_size]
         hidden_states = inputs_embeds
 
         # 注意：旋转位置编码在各decoder层之间共享，只需要计算一次
