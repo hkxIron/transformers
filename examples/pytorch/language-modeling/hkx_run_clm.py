@@ -45,17 +45,17 @@ from transformers import (
     Trainer,
     TrainingArguments,
     default_data_collator,
-    is_torch_xla_available,
+    #is_torch_xla_available,
     set_seed,
 )
-from transformers.testing_utils import CaptureLogger
+#from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.44.0.dev0")
+# check_min_version("4.44.0.dev0")
 
 require_version("datasets>=2.14.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
@@ -316,6 +316,7 @@ def main():
             trust_remote_code=model_args.trust_remote_code,
         )
         if "validation" not in raw_datasets.keys():
+            #
             raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
@@ -358,6 +359,7 @@ def main():
         )
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
         if "validation" not in raw_datasets.keys():
+            # 动态划分一部分测试集
             raw_datasets["validation"] = load_dataset(
                 extension,
                 data_files=data_files,
@@ -459,14 +461,14 @@ def main():
     tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
 
     def tokenize_function(examples):
-        with CaptureLogger(tok_logger) as cl:
-            output = tokenizer(examples[text_column_name])
+        #with CaptureLogger(tok_logger) as cl:
+        output = tokenizer(examples[text_column_name])
         # clm input could be much much longer than block_size
-        if "Token indices sequence length is longer than the" in cl.out:
-            tok_logger.warning(
-                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
-                " before being passed to the model."
-            )
+        # if "Token indices sequence length is longer than the" in cl.out:
+        #     tok_logger.warning(
+        #         "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
+        #         " before being passed to the model."
+        #     )
         return output
 
     with training_args.main_process_first(desc="dataset map tokenization"):
@@ -590,10 +592,8 @@ def main():
         tokenizer=tokenizer,
         # Data collator will default to DataCollatorWithPadding, so we change it.
         data_collator=default_data_collator,
-        compute_metrics=compute_metrics if training_args.do_eval and not is_torch_xla_available() else None,
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics
-        if training_args.do_eval and not is_torch_xla_available()
-        else None,
+        compute_metrics=compute_metrics if training_args.do_eval else None, #and not is_torch_xla_available() else None,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics if training_args.do_eval else None, #and not is_torch_xla_available()
     )
 
     # Training

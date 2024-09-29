@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, List
 
 import torch
+from transformers.trainer_utils import get_last_checkpoint
+
 import transformers
 from torch.utils.data import Dataset
 from transformers import (AutoModelForCausalLM, AutoTokenizer, Trainer,
@@ -290,6 +292,14 @@ if __name__ == "__main__":
         data_collator=lambda x: get_collator(x, training_args.model_max_length, tokenizer)
     )
 
+    checkpoint = None
+    last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    if training_args.resume_from_checkpoint is not None:
+        checkpoint = training_args.resume_from_checkpoint
+    elif last_checkpoint is not None:
+        checkpoint = last_checkpoint
+    train_result = trainer.train(resume_from_checkpoint=checkpoint)
+
     trainer.train()
     # save the incremental PEFT weights, more details can be found in https://huggingface.co/blog/peft
-    trainer.save_model("output_dir")
+    trainer.save_model()
