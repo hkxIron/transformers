@@ -565,6 +565,7 @@ _import_structure = {
         "MgpstrProcessor",
         "MgpstrTokenizer",
     ],
+    "models.minicpm3": ["MiniCPMConfig"],
     "models.mistral": ["MistralConfig"],
     "models.mixtral": ["MixtralConfig"],
     "models.mluke": [],
@@ -2599,6 +2600,11 @@ else:
             "MgpstrForSceneTextRecognition",
             "MgpstrModel",
             "MgpstrPreTrainedModel",
+        ]
+    )
+    _import_structure["models.minicpm3"].extend(
+        [
+            "MiniCPMForCausalLM",
         ]
     )
     _import_structure["models.mistral"].extend(
@@ -7069,6 +7075,9 @@ if TYPE_CHECKING:
             MgpstrForSceneTextRecognition,
             MgpstrModel,
             MgpstrPreTrainedModel,
+        )
+        from .models.minicpm3 import (
+            MiniCPMForCausalLM
         )
         from .models.mistral import (
             MistralForCausalLM,

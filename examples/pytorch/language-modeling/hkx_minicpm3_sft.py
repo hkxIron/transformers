@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 import json
+import os, sys
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List
 
 import torch
+
+sys.path.insert(0,"/media/hkx/win/hkx/ubuntu/work/open/transformers/src")
+print("sys path", sys.path)
+print("cur work path:", os.getcwd())
+
+from transformers.models.llama.tokenization_llama import LlamaTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 
 import transformers
@@ -11,8 +18,12 @@ from torch.utils.data import Dataset
 from transformers import (AutoModelForCausalLM, AutoTokenizer, Trainer,
                           TrainingArguments, BitsAndBytesConfig, BatchEncoding, PreTrainedTokenizer,
                           default_data_collator)
+from transformers.models.minicpm3.modeling_minicpm import MiniCPMForCausalLM
 from transformers.utils import PaddingStrategy
 
+def show_paths():
+    print("cur work path:", os.getcwd())
+    print("sys path", sys.path)
 
 @dataclass
 class ModelArguments:
@@ -162,7 +173,9 @@ def load_model_and_tokenizer(
     fp16: bool = False,
 ):
     """load model and tokenizer"""
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    # minicpm3用的是llamaTokenizer
+    #tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
     assert not (bf16 and fp16), "bf16 or fp16, not both"
@@ -186,17 +199,19 @@ def load_model_and_tokenizer(
             #llm_int8_skip_modules=["out_proj", "kv_proj", "lm_head"],  # 不进行量化的模块
             llm_int8_threshold=6.0,  # llm.int8()算法中的离群值，根据这个值区分是否进行量化
         )
-        model = AutoModelForCausalLM.from_pretrained(
+        #model = AutoModelForCausalLM.from_pretrained(
+        model = MiniCPMForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
             trust_remote_code=True,
             #quantization_config=quantization_config, # 量化需要gpu支持才行
         )
     else:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = MiniCPMForCausalLM.from_pretrained(
+        #model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            trust_remote_code=True,
+            #trust_remote_code=True,
         )
     if use_lora:
         from peft import LoraConfig, TaskType, get_peft_model
@@ -260,6 +275,7 @@ def get_collator(input_dict_list:List[Dict[str, list[int]]], max_seq_length:int,
     return collator_data
 
 if __name__ == "__main__":
+    show_paths()
     #model_path = "/mnt/data/user/tc_agi/yh/models/MiniCPM"
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()

@@ -144,6 +144,7 @@ from . import (
     megatron_bert,
     megatron_gpt2,
     mgp_str,
+    minicpm3,
     mistral,
     mixtral,
     mluke,

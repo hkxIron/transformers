@@ -27,7 +27,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Optional
+from typing import *
 
 import datasets
 import evaluate
@@ -305,77 +305,46 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if data_args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
+    # Downloading and loading a dataset from the hub.
+    raw_datasets = load_dataset(
+        data_args.dataset_name,
+        data_args.dataset_config_name,
+        cache_dir=model_args.cache_dir,
+        token=model_args.token,
+        streaming=data_args.streaming,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+    print(f"datasets:{raw_datasets}")
+    print(f"datasets keys:{raw_datasets.keys()}")
+    print(f"datasets train[0:2]:{raw_datasets['train'][0:2]}")
+    """
+    datasets keys:dict_keys(['train', 'validation', 'test'])
+    datasets train[0:2]:{'prompt': ['请为以下关键词生成一条广告语。\n', '请为以下关键词生成一条广告语。\n'], 
+                         'input': ['类型#裤*版型#宽松*风格#性感*图案#线条*裤型#阔腿裤', '版型#宽松*风格#性感*图案#线条*裤型#长腿裤'], 
+                         'output': ['宽松的阔腿裤这两年真的吸粉不少，明星时尚达人的心头爱。', 
+                                    '加之撞色的鱼尾下摆，深邃富有诗意。收腰包臀,修饰女性身体曲线，结合别出心裁']
+                         }
+    """
+
+    if "validation" not in raw_datasets.keys():
+        raw_datasets["validation"] = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
+            split=f"train[:{data_args.validation_split_percentage}%]",
             cache_dir=model_args.cache_dir,
             token=model_args.token,
             streaming=data_args.streaming,
             trust_remote_code=model_args.trust_remote_code,
         )
-        if "validation" not in raw_datasets.keys():
-            #
-            raw_datasets["validation"] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=f"train[:{data_args.validation_split_percentage}%]",
-                cache_dir=model_args.cache_dir,
-                token=model_args.token,
-                streaming=data_args.streaming,
-                trust_remote_code=model_args.trust_remote_code,
-            )
-            raw_datasets["train"] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=f"train[{data_args.validation_split_percentage}%:]",
-                cache_dir=model_args.cache_dir,
-                token=model_args.token,
-                streaming=data_args.streaming,
-                trust_remote_code=model_args.trust_remote_code,
-            )
-    else:
-        data_files = {}
-        dataset_args = {}
-        if data_args.train_file is not None:
-            data_files["train"] = data_args.train_file
-        if data_args.validation_file is not None:
-            data_files["validation"] = data_args.validation_file
-        extension = (
-            data_args.train_file.split(".")[-1]
-            if data_args.train_file is not None
-            else data_args.validation_file.split(".")[-1]
-        )
-        if extension == "txt":
-            extension = "text"
-            dataset_args["keep_linebreaks"] = data_args.keep_linebreaks
-        raw_datasets = load_dataset(
-            extension,
-            data_files=data_files,
+        raw_datasets["train"] = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            split=f"train[{data_args.validation_split_percentage}%:]",
             cache_dir=model_args.cache_dir,
             token=model_args.token,
-            **dataset_args,
+            streaming=data_args.streaming,
+            trust_remote_code=model_args.trust_remote_code,
         )
-        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if "validation" not in raw_datasets.keys():
-            # 动态划分一部分测试集
-            raw_datasets["validation"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[:{data_args.validation_split_percentage}%]",
-                cache_dir=model_args.cache_dir,
-                token=model_args.token,
-                **dataset_args,
-            )
-            raw_datasets["train"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[{data_args.validation_split_percentage}%:]",
-                cache_dir=model_args.cache_dir,
-                token=model_args.token,
-                **dataset_args,
-            )
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.
@@ -386,23 +355,23 @@ def main():
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
 
-    config_kwargs = {
-        "cache_dir": model_args.cache_dir,
-        "revision": model_args.model_revision,
-        "token": model_args.token,
-        "trust_remote_code": model_args.trust_remote_code,
-    }
-    if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
-    elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
-    else:
-        config = CONFIG_MAPPING[model_args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
-        if model_args.config_overrides is not None:
-            logger.info(f"Overriding config: {model_args.config_overrides}")
-            config.update_from_string(model_args.config_overrides)
-            logger.info(f"New config: {config}")
+    # config_kwargs = {
+    #     "cache_dir": model_args.cache_dir,
+    #     "revision": model_args.model_revision,
+    #     "token": model_args.token,
+    #     "trust_remote_code": model_args.trust_remote_code,
+    # }
+    # if model_args.config_name:
+    #     config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
+    # elif model_args.model_name_or_path:
+    #     config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+    # else:
+    #     config = CONFIG_MAPPING[model_args.model_type]()
+    #     logger.warning("You are instantiating a new config instance from scratch.")
+    #     if model_args.config_overrides is not None:
+    #         logger.info(f"Overriding config: {model_args.config_overrides}")
+    #         config.update_from_string(model_args.config_overrides)
+    #         logger.info(f"New config: {config}")
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -411,37 +380,25 @@ def main():
         "token": model_args.token,
         "trust_remote_code": model_args.trust_remote_code,
     }
-    if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
-    elif model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script. "
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
 
-    if model_args.model_name_or_path:
-        torch_dtype = (
-            model_args.torch_dtype
-            if model_args.torch_dtype in ["auto", None]
-            else getattr(torch, model_args.torch_dtype)
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            token=model_args.token,
-            trust_remote_code=model_args.trust_remote_code,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=model_args.low_cpu_mem_usage,
-        )
-    else:
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
-        n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
-        logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
+    torch_dtype = (
+        model_args.torch_dtype
+        if model_args.torch_dtype in ["auto", None]
+        else getattr(torch, model_args.torch_dtype)
+    )
+    print(f"torch_dtype:{torch_dtype}")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        #config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=model_args.low_cpu_mem_usage,
+    )
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -458,9 +415,9 @@ def main():
     text_column_name = "text" if "text" in column_names else column_names[0]
 
     # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
-    tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
+    #tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
 
-    def tokenize_function(examples):
+    def tokenize_function(examples:Dict[str, Any]):
         #with CaptureLogger(tok_logger) as cl:
         output = tokenizer(examples[text_column_name])
         # clm input could be much much longer than block_size
@@ -472,26 +429,27 @@ def main():
         return output
 
     with training_args.main_process_first(desc="dataset map tokenization"):
-        if not data_args.streaming:
+        if not data_args.streaming: #  可以一次性加载
             tokenized_datasets = raw_datasets.map(
-                tokenize_function,
+                function=tokenize_function,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 remove_columns=column_names,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Running tokenizer on dataset",
             )
-        else:
+        else: # 流式数据是指太大了，不能一次性加截完毕
             tokenized_datasets = raw_datasets.map(
-                tokenize_function,
+                function=tokenize_function,
                 batched=True,
                 remove_columns=column_names,
             )
-    if hasattr(config, "max_position_embeddings"):
-        max_pos_embeddings = config.max_position_embeddings
-    else:
-        # Define a default value if the attribute is missing in the config.
-        max_pos_embeddings = 1024
+    # if hasattr(config, "max_position_embeddings"):
+    #     max_pos_embeddings = config.max_position_embeddings
+    # else:
+    #     # Define a default value if the attribute is missing in the config.
+    #     max_pos_embeddings = 1024
+    max_pos_embeddings = 1024
 
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
@@ -538,7 +496,7 @@ def main():
     with training_args.main_process_first(desc="grouping texts together"):
         if not data_args.streaming:
             lm_datasets = tokenized_datasets.map(
-                group_texts,
+                function=group_texts,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 load_from_cache_file=not data_args.overwrite_cache,
@@ -546,7 +504,7 @@ def main():
             )
         else:
             lm_datasets = tokenized_datasets.map(
-                group_texts,
+                function=group_texts,
                 batched=True,
             )
 
@@ -643,15 +601,10 @@ def main():
         else:
             kwargs["dataset"] = data_args.dataset_name
 
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
-    else:
-        trainer.create_model_card(**kwargs)
-
-
-def _mp_fn(index):
-    # For xla_spawn (TPUs)
-    main()
+    # if training_args.push_to_hub:
+    #     trainer.push_to_hub(**kwargs)
+    # else:
+    #     trainer.create_model_card(**kwargs)
 
 
 if __name__ == "__main__":

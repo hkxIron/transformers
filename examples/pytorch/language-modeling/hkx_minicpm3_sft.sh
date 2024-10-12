@@ -1,15 +1,16 @@
 formatted_time=$(date +"%Y%m%d%H%M%S")
 echo $formatted_time
 
-use_lora=1
+use_lora=0
 
+model_path="/home/hkx/data/work/hf_data_and_model/models/MiniCPM-1B-sft-bf16"
 if [ $use_lora -eq 0 ];then
   python hkx_minicpm3_sft.py \
-      --model_name_or_path /home/hkx/data/work/hf_data_and_model/models/MiniCPM-1B-sft-bf16 \
+      --model_name_or_path ${model_path} \
       --report_to none \
       --output_dir output/AdvertiseGenSFT/$formatted_time/ \
-      --train_data_path data/AdvertiseGenChatML/train.json \
-      --eval_data_path data/AdvertiseGenChatML/dev.json \
+      --train_data_path data/AdvertiseGenChatML/train.jsonl \
+      --eval_data_path data/AdvertiseGenChatML/dev.jsonl \
       --learning_rate 5e-5 --per_device_train_batch_size 2 \
       --per_device_eval_batch_size 1 --bf16 \
       --gradient_accumulation_steps 2 --warmup_steps 100 \
@@ -20,11 +21,11 @@ if [ $use_lora -eq 0 ];then
 else
   # lora
   python hkx_minicpm3_sft.py \
-      --model_name_or_path /home/hkx/data/work/hf_data_and_model/models/MiniCPM-1B-sft-bf16 \
+      --model_name_or_path ${model_path} \
       --report_to none \
       --output_dir output/AdvertiseGenSFT/$formatted_time/ \
-      --train_data_path data/AdvertiseGenChatML/train.json \
-      --eval_data_path data/AdvertiseGenChatML/dev.json \
+      --train_data_path data/AdvertiseGenChatML/train.jsonl \
+      --eval_data_path data/AdvertiseGenChatML/dev.jsonl \
       --learning_rate 5e-5 --per_device_train_batch_size 2 \
       --per_device_eval_batch_size 1 --bf16 \
       --gradient_accumulation_steps 2 --warmup_steps 100 \
