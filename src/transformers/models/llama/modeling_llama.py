@@ -616,14 +616,16 @@ class LlamaAttention(nn.Module):
             )
 
         self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.hidden_size = config.hidden_size # hidden_size:4096
+        self.num_heads = config.num_attention_heads # num_heads=32
+        self.head_dim = self.hidden_size // self.num_heads # head_dim=128
         # num_key_value_heads=1时，为multi query attention(MQA), 即所有query共享一个key
         # num_key_value_heads=num_attention_heads时，为原始的multi head attention(MHA)
         # num_key_value_heads<num_attention_heads时，为group query attention(GQA), 每个group大小为num_key_value_group_size
-        self.num_key_value_heads = config.num_key_value_heads # 默认为num_attention_heads
-        self.num_key_value_group_size = self.num_heads // self.num_key_value_heads # 每个GQA中的group size的大小
+        self.num_key_value_heads = config.num_key_value_heads # 有多少个key/value head,默认为num_attention_heads=32
+        # 假设num_head=32, num_key_value_heads=16, 则：num_key_value_group_size=2,即2个head为一组
+        # 总共只有16个不同的kv了，kv cache大小节省了一半内存
+        self.num_key_value_group_size = self.num_heads // self.num_key_value_heads # 每个GQA中组的大小(group size),后面组大小为多少就将kv复帛多少份
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         # 默认即为因果推断
@@ -649,8 +651,7 @@ class LlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        # attention_mask是样本组成batch时指示非padding与padding部分, padding处mask=0, 非padding处mask=1
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None, # 困果注意力的下三角attention mask , 已叠加样本组成batch时指示非padding与padding部分, padding处mask=0, 非padding处mask=1
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
@@ -725,19 +726,21 @@ class LlamaAttention(nn.Module):
 
         # 如果是GQA,那么num_key_value_heads< num_heads,即key, value向量维度小于query
         # 因此，GQA中需要进行key/value复制,以适合query的大小
-        # 所以，GQA并没有减少attention时的计算量，只是减少了key/value proj时的mlp计算量而己
+        # 所以，GQA并没有减少attention时的计算量，只是减少了推理阶段kv cache的内存大小
         # key_states, value_states: [batch_size, num_key_value_heads, seq_len, head_dim]
         # -> [batch_size, num_heads, seq_len, head_dim]
         key_states = repeat_kv(key_states, self.num_key_value_group_size)
         value_states = repeat_kv(value_states, self.num_key_value_group_size)
 
+        # 所以可以看出，无论是MQA,GQA,它们最后都会进行kv复制，恢复成MQA的shape后再进行attention!!!
         # query_states, key_states: [batch_size, num_heads, seq_len, head_dim]
         # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        # attention_mask: [batch, 1, query_seq_len, key_seq_len]
+        # attention_mask: [batch, 1, query_seq_len, key_seq_len],  因果注意力的下三角attention mask, 每次都会传入
         if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]] # 此处的mask是0与-inf,0的地方参与attention
+            key_seq_len = key_states.shape[-2]
+            causal_mask = attention_mask[:, :, :, : key_seq_len] # 此处的mask是0与-inf,0的地方参与attention, key_states.shape[-2]为seq_len
             attn_weights = attn_weights + causal_mask
             # 有的实现中是直接给0所在的位置一个非常大的负数，以至于在经过softmax后为会0分
             #attn_weights = attn_weights.masked_fill(casual_mask == 0, value=-1e9)
@@ -748,7 +751,7 @@ class LlamaAttention(nn.Module):
         # 现在强制dropout,但attention_dropout默认为0
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training) # 注意：现在attn_weight之后会有一个dropout
         # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
-        # value_states: [batch_size, num_heads, value_seq_len, head_dim]
+        # value_states: [batch_size, num_heads, value_seq_len=key_seq_len, head_dim]
         # attn_output: [batch_size, num_heads, query_seq_len, head_dim]
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -761,7 +764,7 @@ class LlamaAttention(nn.Module):
         # attn_output: [batch_size, num_heads, query_seq_len, head_dim]
         # -> [batch_size, query_seq_len, num_heads, head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
-        # -> [batch_size, query_seq_len, num_heads*head_dim = hidden_size]
+        # -> [batch_size, query_seq_len, num_heads*head_dim = hidden_size] , 记住：num_heads*head_dim = hidden_size
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
 
         if self.config.pretraining_tp > 1:
@@ -786,230 +789,230 @@ class LlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class LlamaFlashAttention2(LlamaAttention):
-    """
-    Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
-    """
+# class LlamaFlashAttention2(LlamaAttention):
+#     """
+#     Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
+#     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
+#     flash attention and deal with padding tokens in case the input contains any of them.
+#     """
+#
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+#
+#         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
+#         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+#         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
+#         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+#
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         attention_mask: Optional[torch.LongTensor] = None,
+#         position_ids: Optional[torch.LongTensor] = None,
+#         past_key_value: Optional[Cache] = None,
+#         output_attentions: bool = False,
+#         use_cache: bool = False,
+#         cache_position: Optional[torch.LongTensor] = None,
+#         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+#     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+#         if isinstance(past_key_value, StaticCache):
+#             raise ValueError(
+#                 "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
+#                 "make sure to use `sdpa` in the mean time, and open an issue at https://github.com/huggingface/transformers"
+#             )
+#
+#         output_attentions = False
+#
+#         bsz, q_len, _ = hidden_states.size()
+#
+#         query_states = self.q_proj(hidden_states)
+#         key_states = self.k_proj(hidden_states)
+#         value_states = self.v_proj(hidden_states)
+#
+#         # Flash attention requires the input to have the shape
+#         # batch_size x seq_length x head_dim x hidden_dim
+#         # therefore we just need to keep the original shape
+#         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+#         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+#         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+#
+#         if position_embeddings is None:
+#             logger.warning_once(
+#                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+#                 "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+#                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
+#                 "removed and `position_embeddings` will be mandatory."
+#             )
+#             cos, sin = self.rotary_emb(value_states, position_ids)
+#         else:
+#             cos, sin = position_embeddings
+#         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+#
+#         if past_key_value is not None:
+#             # sin and cos are specific to RoPE models; cache_position needed for the static cache
+#             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+#             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+#
+#         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+#         # to be able to avoid many of these transpose/reshape/view.
+#         query_states = query_states.transpose(1, 2)
+#         key_states = key_states.transpose(1, 2)
+#         value_states = value_states.transpose(1, 2)
+#
+#         dropout_rate = self.attention_dropout if self.training else 0.0
+#
+#         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+#         # therefore the input hidden states gets silently casted in float32. Hence, we need
+#         # cast them back in the correct dtype just to be sure everything works as expected.
+#         # This might slowdown training & inference so it is recommended to not cast the LayerNorms
+#         # in fp32. (LlamaRMSNorm handles it correctly)
+#
+#         input_dtype = query_states.dtype
+#         if input_dtype == torch.float32:
+#             if torch.is_autocast_enabled():
+#                 target_dtype = torch.get_autocast_gpu_dtype()
+#             # Handle the case where the model is quantized
+#             elif hasattr(self.config, "_pre_quantization_dtype"):
+#                 target_dtype = self.config._pre_quantization_dtype
+#             else:
+#                 target_dtype = self.q_proj.weight.dtype
+#
+#             logger.warning_once(
+#                 f"The input hidden states seems to be silently casted in float32, this might be related to"
+#                 f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+#                 f" {target_dtype}."
+#             )
+#
+#             query_states = query_states.to(target_dtype)
+#             key_states = key_states.to(target_dtype)
+#             value_states = value_states.to(target_dtype)
+#
+#         attn_output = _flash_attention_forward(
+#             query_states,
+#             key_states,
+#             value_states,
+#             attention_mask,
+#             q_len,
+#             position_ids=position_ids,
+#             dropout=dropout_rate,
+#             sliding_window=getattr(self, "sliding_window", None),
+#             use_top_left_mask=self._flash_attn_uses_top_left_mask,
+#             is_causal=self.is_causal,
+#         )
+#
+#         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+#         attn_output = self.o_proj(attn_output)
+#
+#         if not output_attentions:
+#             attn_weights = None
+#
+#         return attn_output, attn_weights, past_key_value
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
 
-        # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if isinstance(past_key_value, StaticCache):
-            raise ValueError(
-                "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
-                "make sure to use `sdpa` in the mean time, and open an issue at https://github.com/huggingface/transformers"
-            )
-
-        output_attentions = False
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        # Flash attention requires the input to have the shape
-        # batch_size x seq_length x head_dim x hidden_dim
-        # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
-        # to be able to avoid many of these transpose/reshape/view.
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        dropout_rate = self.attention_dropout if self.training else 0.0
-
-        # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-        # therefore the input hidden states gets silently casted in float32. Hence, we need
-        # cast them back in the correct dtype just to be sure everything works as expected.
-        # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-        # in fp32. (LlamaRMSNorm handles it correctly)
-
-        input_dtype = query_states.dtype
-        if input_dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
-            # Handle the case where the model is quantized
-            elif hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.q_proj.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
-
-        attn_output = _flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            q_len,
-            position_ids=position_ids,
-            dropout=dropout_rate,
-            sliding_window=getattr(self, "sliding_window", None),
-            use_top_left_mask=self._flash_attn_uses_top_left_mask,
-            is_causal=self.is_causal,
-        )
-
-        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-
-class LlamaSdpaAttention(LlamaAttention):
-    """
-    Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
-    SDPA API.
-    """
-
-    # Adapted from LlamaAttention.forward
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-            logger.warning_once(
-                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-            )
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            cos, sin = self.rotary_emb.forward(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
-
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        key_states = repeat_kv(key_states, self.num_key_value_group_size)
-        value_states = repeat_kv(value_states, self.num_key_value_group_size)
-
-        causal_mask = attention_mask
-        if attention_mask is not None:
-            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
-
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and causal_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-
-        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-        is_causal = True if causal_mask is None and q_len > 1 else False
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=causal_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-        )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
-
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
+# class LlamaSdpaAttention(LlamaAttention):
+#     """
+#     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+#     `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+#     SDPA API.
+#     """
+#
+#     # Adapted from LlamaAttention.forward
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         attention_mask: Optional[torch.Tensor] = None,
+#         position_ids: Optional[torch.LongTensor] = None,
+#         past_key_value: Optional[Cache] = None,
+#         output_attentions: bool = False,
+#         use_cache: bool = False,
+#         cache_position: Optional[torch.LongTensor] = None,
+#         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+#         **kwargs,
+#     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+#         if output_attentions:
+#             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+#             logger.warning_once(
+#                 "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+#                 'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+#             )
+#             return super().forward(
+#                 hidden_states=hidden_states,
+#                 attention_mask=attention_mask,
+#                 position_ids=position_ids,
+#                 past_key_value=past_key_value,
+#                 output_attentions=output_attentions,
+#                 use_cache=use_cache,
+#                 cache_position=cache_position,
+#                 position_embeddings=position_embeddings,
+#             )
+#
+#         bsz, q_len, _ = hidden_states.size()
+#
+#         query_states = self.q_proj(hidden_states)
+#         key_states = self.k_proj(hidden_states)
+#         value_states = self.v_proj(hidden_states)
+#
+#         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+#         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+#         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+#
+#         if position_embeddings is None:
+#             logger.warning_once(
+#                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+#                 "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+#                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
+#                 "removed and `position_embeddings` will be mandatory."
+#             )
+#             cos, sin = self.rotary_emb.forward(value_states, position_ids)
+#         else:
+#             cos, sin = position_embeddings
+#
+#         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+#
+#         if past_key_value is not None:
+#             # sin and cos are specific to RoPE models; cache_position needed for the static cache
+#             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+#             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+#
+#         key_states = repeat_kv(key_states, self.num_key_value_group_size)
+#         value_states = repeat_kv(value_states, self.num_key_value_group_size)
+#
+#         causal_mask = attention_mask
+#         if attention_mask is not None:
+#             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+#
+#         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+#         # Reference: https://github.com/pytorch/pytorch/issues/112577.
+#         if query_states.device.type == "cuda" and causal_mask is not None:
+#             query_states = query_states.contiguous()
+#             key_states = key_states.contiguous()
+#             value_states = value_states.contiguous()
+#
+#         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+#         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+#         is_causal = True if causal_mask is None and q_len > 1 else False
+#
+#         attn_output = torch.nn.functional.scaled_dot_product_attention(
+#             query_states,
+#             key_states,
+#             value_states,
+#             attn_mask=causal_mask,
+#             dropout_p=self.attention_dropout if self.training else 0.0,
+#             is_causal=is_causal,
+#         )
+#
+#         attn_output = attn_output.transpose(1, 2).contiguous()
+#         attn_output = attn_output.view(bsz, q_len, -1)
+#
+#         attn_output = self.o_proj(attn_output)
+#
+#         return attn_output, None, past_key_value
 
 
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
-    "flash_attention_2": LlamaFlashAttention2,
-    "sdpa": LlamaSdpaAttention, # scaled_dot_product_attention
+    #"flash_attention_2": LlamaFlashAttention2,
+    #"sdpa": LlamaSdpaAttention, # scaled_dot_product_attention
 }
 
 
@@ -1228,7 +1231,6 @@ LLAMA_INPUTS_DOCSTRING = r"""
 class LlamaModel(LlamaPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
-
     Args:
         config: LlamaConfig
     """

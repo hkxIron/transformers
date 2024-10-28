@@ -6,9 +6,11 @@ from typing import Dict, Optional, List
 
 import torch
 
-sys.path.insert(0,"/media/hkx/win/hkx/ubuntu/work/open/transformers/src")
+models_path="/".join(os.getcwd().split("/")[0:-3]) + "/src"
+sys.path.insert(0, models_path)
 print("sys path", sys.path)
 print("cur work path:", os.getcwd())
+print("models path:", models_path)
 
 from transformers.models.llama.tokenization_llama import LlamaTokenizer
 from transformers.trainer_utils import get_last_checkpoint
@@ -276,6 +278,7 @@ def get_collator(input_dict_list:List[Dict[str, list[int]]], max_seq_length:int,
 
 if __name__ == "__main__":
     show_paths()
+    #exit(0)
     #model_path = "/mnt/data/user/tc_agi/yh/models/MiniCPM"
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
