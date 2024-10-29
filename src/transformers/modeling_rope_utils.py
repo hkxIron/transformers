@@ -65,7 +65,7 @@ def _compute_default_rope_parameters(
     # Compute the inverse frequencies
     # base=10000
     # 计算词向量元素两两分组之后，每组元素对应的旋转角度
-    # inv_freq shape: [dim / 2], 其值为: 1 / 10000 ^ (2 * dim_index / dim)
+    # inv_freq shape: [dim / 2], 其值为: 1 / [ 10000 ^ (even_dim_index / dim) ]
     # 当 dim_index=0时，inv_freq=1
     # 当 dim_index=dim时，inv_freq=1/10000
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))

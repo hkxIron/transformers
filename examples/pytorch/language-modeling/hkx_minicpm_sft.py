@@ -20,7 +20,7 @@ from torch.utils.data import Dataset
 from transformers import (AutoModelForCausalLM, AutoTokenizer, Trainer,
                           TrainingArguments, BitsAndBytesConfig, BatchEncoding, PreTrainedTokenizer,
                           default_data_collator)
-from transformers.models.minicpm3.modeling_minicpm import MiniCPM3ForCausalLM
+from transformers.models.minicpm.modeling_minicpm import MiniCPMForCausalLM
 from transformers.utils import PaddingStrategy
 
 def show_paths():
@@ -201,14 +201,15 @@ def load_model_and_tokenizer(
             #llm_int8_skip_modules=["out_proj", "kv_proj", "lm_head"],  # 不进行量化的模块
             llm_int8_threshold=6.0,  # llm.int8()算法中的离群值，根据这个值区分是否进行量化
         )
-        model = MiniCPM3ForCausalLM.from_pretrained(
+        #model = AutoModelForCausalLM.from_pretrained(
+        model = MiniCPMForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
             trust_remote_code=True,
             #quantization_config=quantization_config, # 量化需要gpu支持才行
         )
     else:
-        model = MiniCPM3ForCausalLM.from_pretrained(
+        model = MiniCPMForCausalLM.from_pretrained(
         #model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,

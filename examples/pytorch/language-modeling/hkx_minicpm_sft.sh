@@ -3,9 +3,12 @@ echo $formatted_time
 
 use_lora=0
 
+#注意：这个不是MiniCPMV3，而是MiniCPM1
+#模型详见：https://hf-mirror.com/openbmb/MiniCPM-1B-sft-bf16
+
 model_path="/home/hkx/data/work/hf_data_and_model/models/MiniCPM-1B-sft-bf16"
 if [ $use_lora -eq 0 ];then
-  python hkx_minicpm3_sft.py \
+  python hkx_minicpm_sft.py \
       --model_name_or_path ${model_path} \
       --report_to none \
       --output_dir output/AdvertiseGenSFT/$formatted_time/ \
@@ -20,7 +23,7 @@ if [ $use_lora -eq 0 ];then
       --log_level info --logging_strategy steps --logging_steps 10
 else
   # lora
-  python hkx_minicpm3_sft.py \
+  python hkx_minicpm_sft.py \
       --model_name_or_path ${model_path} \
       --report_to none \
       --output_dir output/AdvertiseGenSFT/$formatted_time/ \

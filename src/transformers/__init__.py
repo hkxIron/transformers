@@ -7076,7 +7076,7 @@ if TYPE_CHECKING:
             MgpstrModel,
             MgpstrPreTrainedModel,
         )
-        from .models.minicpm3 import (
+        from .models.minicpm import (
             MiniCPMForCausalLM
         )
         from .models.mistral import (

@@ -28,7 +28,7 @@ logger = logging.get_logger(__name__)
 MINICPM_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
-class MiniCPM3Config(PretrainedConfig):
+class MiniCPMConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`MiniCPMModel`]. It is used to instantiate an MiniCPM
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -110,8 +110,8 @@ class MiniCPM3Config(PretrainedConfig):
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
-
-    model_type = "minicpm3"
+    # 这个是minicpm1 不是minicpm3
+    model_type = "minicpm"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -122,12 +122,6 @@ class MiniCPM3Config(PretrainedConfig):
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads=None,
-        qk_nope_head_dim=64,
-        qk_rope_head_dim=32,
-        q_lora_rank=768,
-        kv_lora_rank=256,
-        v_head_dim=None,
-        head_dim=None,
         hidden_act="silu",
         max_position_embeddings=2048,
         initializer_range=0.02,
@@ -153,15 +147,7 @@ class MiniCPM3Config(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-        
-        if v_head_dim is None:
-            v_head_dim = qk_nope_head_dim
-        self.v_head_dim = v_head_dim
-        
+
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
@@ -174,12 +160,12 @@ class MiniCPM3Config(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+        self._rope_scaling_validation()
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.scale_emb = scale_emb
         self.dim_model_base = dim_model_base
         self.scale_depth = scale_depth
-        self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -193,3 +179,24 @@ class MiniCPM3Config(PretrainedConfig):
             self._attn_implementation = "flash_attention_2"
         except:
             pass
+
+    def _rope_scaling_validation(self):
+        """
+        Validate the `rope_scaling` configuration.
+        """
+        if self.rope_scaling is None:
+            return
+
+        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
+            raise ValueError(
+                "`rope_scaling` must be a dictionary with with two fields, `type` and `factor`, "
+                f"got {self.rope_scaling}"
+            )
+        rope_scaling_type = self.rope_scaling.get("type", None)
+        rope_scaling_factor = self.rope_scaling.get("factor", None)
+        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
+            raise ValueError(
+                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
+            )
+        if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
+            raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")

@@ -23,26 +23,26 @@ from ...utils import (
 )
 
 
-_import_structure = {
-    "configuration_minicpm": ["MiniCPMConfig"],
-}
-
-
-_import_structure["modeling_minicpm"] = [
-    "MiniCPMForCausalLM",
-    "MiniCPMModel",
-    "MiniCPMPreTrainedModel",
-    "MiniCPMForSequenceClassification",
-    "MiniCPMForTokenClassification",
-]
-
-
-if TYPE_CHECKING:
-    from .configuration_minicpm import MiniCPMConfig
-
-    from .modeling_minicpm import (
-        MiniCPMForCausalLM,
-        MiniCPMForSequenceClassification,
-        MiniCPMModel,
-        MiniCPMPreTrainedModel,
-    )
+# _import_structure = {
+#     "configuration_minicpm": ["MiniCPMConfig"],
+# }
+#
+#
+# _import_structure["modeling_minicpm"] = [
+#     "MiniCPMForCausalLM",
+#     "MiniCPMModel",
+#     "MiniCPMPreTrainedModel",
+#     "MiniCPMForSequenceClassification",
+#     "MiniCPMForTokenClassification",
+# ]
+#
+#
+# if TYPE_CHECKING:
+#     from .configuration_minicpm import MiniCPMConfig
+#
+#     from .modeling_minicpm import (
+#         MiniCPMForCausalLM,
+#         MiniCPMForSequenceClassification,
+#         MiniCPMModel,
+#         MiniCPMPreTrainedModel,
+#     )
