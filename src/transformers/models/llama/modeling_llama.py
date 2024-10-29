@@ -193,10 +193,12 @@ class LlamaRotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        # inv_freq shape: [dim / 2], 其值为: 1 / 10000 ^ (2 * dim_index / dim)
+        # inv_freq shape: [dim//2], 其值为: 1 / 10000 ^ (even_dim_index / dim)
+        # inv_freq = 1.0 / [base ** (range(0, dim, 2)/dim)], 为一个向量
+        # inv_freq就是ROPE中的theta角度
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
         self.register_buffer("inv_freq", inv_freq, persistent=False) # buffer就是常量，不会计算梯度
-        self.original_inv_freq = self.inv_freq
+        self.original_inv_freq = self.inv_freq # 取的buffer值
 
     def _dynamic_frequency_update(self, position_ids, device):
         """
@@ -227,7 +229,7 @@ class LlamaRotaryEmbedding(nn.Module):
 
         # Core RoPE block
         # position_ids: [batch, sequence_length]
-        # inv_freq shape: [dim / 2], 其值为: 1 / 10000 ^ (2 * dim_index / dim)
+        # inv_freq shape: [dim/2], 其值为: 1 / 10000 ^ (even_dim_index / dim)
         # => [1, dim/2, 1],其中dim=head_dim
         # inv_freq_expand:[batch, dim/2, 1], expand只适用于复制维度为1的
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
@@ -239,15 +241,18 @@ class LlamaRotaryEmbedding(nn.Module):
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            # inv_freq_expand:[batch, dim/2, 1], 其值为: 1 / 10000 ^ (2 * dim_index / dim)
+            # inv_freq_expand:[batch, dim/2, 1], 其值为: 1 / 10000 ^ (even_dim_index / dim)
             # position_ids_expanded: [batch, 1, seq_len],
             # freqs: [batch, dim/2, seq_len]
-            #     => [batch, seq_len, dim/2]
-            # 即公式里的：pos / (10000^(2*i/dim)), position_embed(m) = e^(j*m*theta) = e^(j*m/[10000^(2i/dim)]),其中j为虚数单位
+            # 转置 => [batch, seq_len, dim/2]
+            # 即公式里的：pos / (10000^(2*i/dim)),
+            # position_embed(m) = e^(j*m*theta) = e^(j*m/[10000^(2i/dim)]),其中j为虚数单位
             """
-            freqs: 在最后一维dim维
-            [batch, seq_len, dim]
-            示例数据： 
+            inv_freq @ position_ids的物理意义是对batch的每条样本都将inv_freq向量复制一份
+            
+            freqs: 在最后一维head_dim维
+            [batch, seq_len, head_dim/2]
+            freqs示例数据： 
             [batch, seq_len=m, [m*theta0,
                                 m*theta1,
                                 m*theta2,
@@ -257,7 +262,8 @@ class LlamaRotaryEmbedding(nn.Module):
                                 ]]
             """
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            # emb: [batch, seq_len, dim]
+            # freqs: [batch, seq_len, dim/2]
+            # emb:  [batch, seq_len, dim]
             emb = torch.cat((freqs, freqs), dim=-1)
             """
             cos: 在最后一维dim维
@@ -333,11 +339,11 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         super().__init__(*args, **kwargs)
 
 
-def rotate_half(x):
+def rotate_half(x:torch.Tensor):
     """Rotates half the hidden dims of the input."""
     # x: [batch, num_head, seq_len, head_dim]
-    x1 = x[..., : x.shape[-1] // 2] # 前半部分
-    x2 = x[..., x.shape[-1] // 2 :] # 后半部分
+    x1 = x[..., : x.shape[-1] // 2] # 最后一维取前半部分
+    x2 = x[..., x.shape[-1] // 2 :] # 最后一维取后半部分
     """
     x.shape: [batch, num_head, seq_len, head_dim]
     [batch=0, num_head=0, seq_len=0, head_dim= [ -x(dim/2+1),
@@ -359,6 +365,10 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
+
+    对query,key应用rope,因为它们要进行内积
+    q: [batch, num_head, seq_len, head_dim]
+    k: [batch, num_key_value_heads, seq_len, head_dim]
 
     Args:
         q (`torch.Tensor`): The query tensor.
@@ -402,10 +412,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # =>   [batch, num_head=1, seq_len, head_dim]
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    # q: [batch, num_head, seq_len, head_dim]
-    # k: [batch, num_key_value_heads, seq_len, head_dim]
+
     """
-   
     q:
     [batch==0, num_head==0, seq_len==0, head_dim= [ 
                                                  q0,
@@ -441,7 +449,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     ]    
     
     rotate_half(q): 
-    [batch==0, num_head==0, seq_len==0, head_dim= [ -q(dim/2+1),
+    [batch==0, num_head==0, seq_len==0, head_dim=[-q(dim/2+1),
                                                  -q(dim/2+2),
                                                  -q(dim/2+3),
                                                   ...,
@@ -472,37 +480,41 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
                         sin(m*theta(head_dim//2-1))
                         ]]
                         
-    因此，最终q_embed:
+    由q_embed = (q * cos) + (rotate_half(q) * sin)可得如下矩阵，
+    q_embed:
     [batch==0, num_head==0, seq_len==0, head_dim= [ 
-                                                     q0*cos(m*theta0)-q(dim/2+1)*sin(m*theta0),
+                                                     q0*cos(m*theta0)-q(dim/2+1)*sin(m*theta0), # [q0, q(dim/2+1)]作为一个复向量，旋转角度theta0
                                                      q1*cos(m*theta1)-q(dim/2+2)*sin(m*theta1),
                                                      q2*cos(m*theta2)-q(dim/2+3)*sin(m*theta2),
                                                      ...,
                                                      q(dim/2)*cos(m*theta(dim/2))-q(dim-1)*sin(m*theta(dim/2)),
                                                      ----------
-                                                     q(dim/2+1)*cos(m*theta0)+q0*sin(m*theta0),
+                                                     q(dim/2+1)*cos(m*theta0)+q0*sin(m*theta0), # [q0, q(dim/2+1)]作为一个复向量，旋转角度theta0
                                                      q(dim/2+2)*cos(m*theta1)+q1*sin(m*theta1),
                                                      q(dim/2+3)*cos(m*theta2)+q2*sin(m*theta2),
                                                      ...,
                                                      q(dim-1)*cos(m*theta(dim/2))+q(dim/2)*sin(m*theta(dim/2))
                                                     ]
      
-    注意：这里q_embed与RoFormer中的RoPE 构造公式不同, 即RoFormer中是将相邻位置(q0,q1)作为复数的实部与虚部，而hugging face中llama中是将(qi,q(i+d/2))分别作为复数的实部与虚部,
+    注意：这里q_embed与RoFormer中的RoPE构造公式不同, 即RoFormer中是将相邻位置(q0,q1)作为复数的实部与虚部，而huggingface中llama中是将(qi,q(i+d/2))分别作为复数的实部与虚部,
     meta实现的llama则与原RoFormer中的Rope保持一致
     
     RoFormer中的Rope
     = [q0, q1, q2, ..., q(d-2), q(d-1)] .* [cos(m*theta0), cos(m*theta0), cos(m*theta1),cos(m*theta1), ..., cos(m*theta(head_dim/2)),cos(m*theta(dim/2))]  .*代表逐元素相乘
     + [-q1,q0,-q3, ...,-q(d-1), q(d-2)] .* [sin(m*theta0), sin(m*theta0), sin(m*theta1),sin(m*theta1), ..., sin(m*theta(head_dim/2)),sin(m*theta(dim/2))]
     = [
-       q0*cos(m*theta0)-q1*sin(m*theta0),
-       q1*cost(m*theta0)+q0*sin(m*theta0),
+       q0*cos(m*theta0)-q1*sin(m*theta0), # 即[q0,q1]作为复向量
+       q1*cos(m*theta0)+q0*sin(m*theta0), # 即[q0,q1]作为复向量
+       
        q2*cos(m*theta1)-q3*sin(m*theta1),
        q3*cost(m*theta1)+q2*sin(m*theta1),
        ...
-      q(d-2)*cos(m*theta(dim/2))-q(d-1)*sin(m*theta(dim/2)),
-      q(d-1)*cos(m*theta(dim/2))-q(d-2)*sin(m*theta(dim/2))
+       q(d-2)*cos(m*theta(dim/2))-q(d-1)*sin(m*theta(dim/2)), # [q(d-2), q(d-1)]作为复向量
+       q(d-1)*cos(m*theta(dim/2))-q(d-2)*sin(m*theta(dim/2))
     ]
     """
+    # q: [batch, num_head, seq_len, head_dim]
+    # k: [batch, num_key_value_heads, seq_len, head_dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -710,14 +722,15 @@ class LlamaAttention(nn.Module):
                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
                 "removed and `position_embeddings` will be mandatory."
             )
-            # position_ids: [batch_size, sequence_length]
+            # position_ids: [batch_size, seq_len]
+            # cos, sin: [batch, seq_len, dim]
             cos, sin = self.rotary_emb.forward(value_states, position_ids)
         else:
             cos, sin = position_embeddings
 
         # query_states:[batch_size, num_head, seq_len, head_dim]
         # key_states: [batch_size, num_key_value_heads, seq_len, head_dim]
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin) # 对 query,key应用rope,因为它们要进行内积
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
