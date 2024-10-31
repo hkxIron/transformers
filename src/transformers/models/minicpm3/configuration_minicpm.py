@@ -147,16 +147,16 @@ class MiniCPM3Config(PretrainedConfig):
         scale_depth=1,
         **kwargs,
     ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
+        self.vocab_size = vocab_size # 32000
+        self.max_position_embeddings = max_position_embeddings # 2048
+        self.hidden_size = hidden_size # 4096
+        self.intermediate_size = intermediate_size # 11008
+        self.num_hidden_layers = num_hidden_layers # 32
+        self.num_attention_heads = num_attention_heads # 32
+        self.qk_nope_head_dim = qk_nope_head_dim # 64 , 非position embedding的维度
+        self.qk_rope_head_dim = qk_rope_head_dim # 32, rope的维度
+        self.q_lora_rank = q_lora_rank # 768
+        self.kv_lora_rank = kv_lora_rank # 256
         
         if v_head_dim is None:
             v_head_dim = qk_nope_head_dim
@@ -164,7 +164,7 @@ class MiniCPM3Config(PretrainedConfig):
         
         # for backward compatibility
         if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
+            num_key_value_heads = num_attention_heads # 32
 
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act

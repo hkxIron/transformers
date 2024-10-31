@@ -220,6 +220,8 @@ class LlamaRotaryEmbedding(nn.Module):
 
     @torch.no_grad() # 注意：这里是no_grad
     def forward(self, x, position_ids):
+        # 其实此处只用了x的device_type
+
         # x: [batch_size, num_key_value_heads, seq_len, head_dim], x为query或key
         # position_ids: [batch_size, sequence_length]
 
@@ -483,7 +485,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     由q_embed = (q * cos) + (rotate_half(q) * sin)可得如下矩阵，
     q_embed:
     [batch==0, num_head==0, seq_len==0, head_dim= [ 
-                                                     q0*cos(m*theta0)-q(dim/2+1)*sin(m*theta0), # [q0, q(dim/2+1)]作为一个复向量，旋转角度theta0
+                                                     q0*cos(m*theta0)-q(dim/2+1)*sin(m*theta0), # [q0, q(dim/2+1)]作为一个复向量，然后对此复向量旋转m*theta0角度
                                                      q1*cos(m*theta1)-q(dim/2+2)*sin(m*theta1),
                                                      q2*cos(m*theta2)-q(dim/2+3)*sin(m*theta2),
                                                      ...,
@@ -499,11 +501,33 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     注意：这里q_embed与RoFormer中的RoPE构造公式不同, 即RoFormer中是将相邻位置(q0,q1)作为复数的实部与虚部，而huggingface中llama中是将(qi,q(i+d/2))分别作为复数的实部与虚部,
     meta实现的llama则与原RoFormer中的Rope保持一致
     
+    hf transformers中的llama是构造cos,sin矩阵与q相乘，实现时是将[qi,q(i+dim/2)]作为复数的虚部与实部
+    facebook中的llama是构造复数e(i*m*theta),直接与q相乘，实现时与RoFormer中的ROPE一致，是将相邻元素[qi,q(i+1)]作为复数的虚部与实部.
+    RoFormer rope: https://github.com/huggingface/transformers/blob/8e164c5400b7b413c7b8fb32e35132001effc970/src/transformers/models/roformer/modeling_roformer.py#L328-L331
+    
+    1.因此两种格式间需要转换，对于meta官方的模型转换成hf格式时，需要将meta interleaved-style ( GPT-NeoX style RoPE) 转换为hf two_half_style (GPT-J style RoPE)
+    
+    transformers/src/transformers/models/llama/convert_llama_weights_to_hf.py, Lines 113 to 115 in e42587f
+    转换代码见：
+    # permute for sliced rotary 
+    def permute(w, n_heads=n_heads, dim1=dim, dim2=dim): 
+        return w.view(n_heads, dim1 // n_heads // 2, 2, dim2).transpose(1, 2).reshape(dim1, dim2) 
+    
+    2. 为何hf不采用llama中的interleaved的格式呢？
+     - 最重要的是因为许可证的原因licence
+     - 其次, Eleuther's Rope 是等价的, 并且op算子更少, 因此效率更高
+    
+    详细讨论见： 
+    https://github.com/huggingface/transformers/issues/25199
+    
+    
+    theta值为: [batch, dim/2, 1] = 1 / 10000 ^ (even_dim_index / dim)
+    
     RoFormer中的Rope
     = [q0, q1, q2, ..., q(d-2), q(d-1)] .* [cos(m*theta0), cos(m*theta0), cos(m*theta1),cos(m*theta1), ..., cos(m*theta(head_dim/2)),cos(m*theta(dim/2))]  .*代表逐元素相乘
     + [-q1,q0,-q3, ...,-q(d-1), q(d-2)] .* [sin(m*theta0), sin(m*theta0), sin(m*theta1),sin(m*theta1), ..., sin(m*theta(head_dim/2)),sin(m*theta(dim/2))]
     = [
-       q0*cos(m*theta0)-q1*sin(m*theta0), # 即[q0,q1]作为复向量
+       q0*cos(m*theta0)-q1*sin(m*theta0), # 即[q0,q1]作为复向量,然后对此复向量旋转m*theta0角度
        q1*cos(m*theta0)+q0*sin(m*theta0), # 即[q0,q1]作为复向量
        
        q2*cos(m*theta1)-q3*sin(m*theta1),
@@ -513,9 +537,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
        q(d-1)*cos(m*theta(dim/2))-q(d-2)*sin(m*theta(dim/2))
     ]
     """
-    # q: [batch, num_head, seq_len, head_dim]
-    # k: [batch, num_key_value_heads, seq_len, head_dim]
-    q_embed = (q * cos) + (rotate_half(q) * sin)
+    # q:  [batch, num_head, seq_len, head_dim]
+    # k:  [batch, num_key_value_heads, seq_len, head_dim]
+    # cos:[batch, num_head=1, seq_len, head_dim]
+    # q_embed: [batch, num_head, seq_len, head_dim]
+    # k_embed: [batch, num_head, seq_len, head_dim]
+    q_embed = (q * cos) + (rotate_half(q) * sin) # GPT-NeoX style RoPE, 即half-style rope
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
@@ -733,6 +760,7 @@ class LlamaAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin) # 对 query,key应用rope,因为它们要进行内积
 
         if past_key_value is not None:
+            # 如果启用了kv cache, 则更新KV cache
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)

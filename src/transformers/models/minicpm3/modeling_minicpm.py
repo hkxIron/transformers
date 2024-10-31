@@ -283,6 +283,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     k_fp32 = k.to(dtype=torch.float32, device=k.device)
     q_embed = (q_fp32 * cos) + (rotate_half(q_fp32) * sin)
     k_embed = (k_fp32 * cos) + (rotate_half(k_fp32) * sin)
+    # q_embed: [batch, num_head, seq_len, head_dim]
+    # k_embed: [batch, num_head, seq_len, head_dim]
     return q_embed.to(dtype=orig_dtype), k_embed.to(dtype=orig_dtype)
 
 class MiniCPMMLP(nn.Module):
@@ -346,38 +348,39 @@ class MiniCPMAttention(nn.Module):
                 "when creating this class."
             )
 
-        self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        self.attention_dropout = config.attention_dropout # 0.0
+        self.hidden_size = config.hidden_size # 4096
+        self.num_heads = config.num_attention_heads # 32
 
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.q_lora_rank = config.q_lora_rank
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.kv_lora_rank = config.kv_lora_rank
-        self.v_head_dim = config.hidden_size // config.num_attention_heads
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.max_position_embeddings = config.max_position_embeddings # 2048
+        self.rope_theta = config.rope_theta # 10000
+        self.q_lora_rank = config.q_lora_rank # 768 ,注意：这里的lora并非我们所谓的MLA(Multi-head Latent Attention)，而是对q直接进行了lora低秩转换
+        self.qk_rope_head_dim = config.qk_rope_head_dim # 32
+        self.kv_lora_rank = config.kv_lora_rank # 256
+        self.v_head_dim = config.hidden_size // config.num_attention_heads # 4096//32, v_head_dim: 128
+        self.qk_nope_head_dim = config.qk_nope_head_dim # 64, no position embedding维度
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim # 64 + 32, rope的维度
 
         self.is_causal = True
 
+        # lora中的a
         self.q_a_proj = nn.Linear(
             self.hidden_size, config.q_lora_rank, bias=config.attention_bias
         )
         self.q_a_layernorm = MiniCPMRMSNorm(config.q_lora_rank)
+        # lora中的b
         self.q_b_proj = nn.Linear(
             config.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
         )
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
-            bias=config.attention_bias,
+            bias=config.attention_bias, # False
         )
         self.kv_a_layernorm = MiniCPMRMSNorm(config.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
-            self.num_heads
-            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
+            self.num_heads * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
             bias=False,
         )
 
@@ -442,26 +445,49 @@ class MiniCPMAttention(nn.Module):
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
+        # hidden_states: [batch_size, seq_len, hidden_dim]
+        batch_size, q_len, _ = hidden_states.size()
 
-        bsz, q_len, _ = hidden_states.size()
-
+        # 对x 先降维+layernorm+再升维 得到q
+        # q:[batch_size, q_len, num_heads*q_head_dim]
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+
+        # q:[batch_size, q_len, num_heads*q_head_dim]
+        # =>[batch_size, q_len, num_heads, q_head_dim]
+        # =>[batch_size, num_heads, q_len, q_head_dim=qk_nope_head_dim+qk_rope_head_dim]
+        q = q.view(batch_size, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+        # q分割成no position embedding与position embedding维度
+        # q_nope: [batch_size, num_heads, q_len, qk_nope_head_dim], 将一部分作为非rope维度
+        # q_pe:   [batch_size, num_heads, q_len, qk_rope_head_dim], rope的维度, 后续只对rope部分进行旋转
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        # hidden_states: [batch_size, seq_len, hidden_dim]
+        # compressed_kv: [batch_size, seq_len, kv_lora_rank+qk_rope_head_dim]
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states) # 对kv降维
+        # compressed_kv: [batch_size, seq_len, kv_lora_rank]
+        # k_pe: [batch_size, seq_len, qk_rope_head_dim]
         compressed_kv, k_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
-        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        # k_pe: [batch_size, q_len, head_num=1, qk_rope_head_dim]
+        # =>[batch_size, head_num=1, q_len, qk_rope_head_dim]
+        k_pe = k_pe.view(batch_size, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        # compressed_kv: [batch_size, seq_len, kv_lora_rank]
+        # lora_b升维 =>[batch_size, seq_len, num_heads*(self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim)]
+        # =>[batch_size, seq_len, num_heads*(self.qk_nope_head_dim + self.v_head_dim)]
+        # .view=>[batch_size, seq_len, num_heads, self.qk_nope_head_dim + self.v_head_dim]
+        # .transpose => [batch_size, num_heads, seq_len, self.qk_nope_head_dim + self.v_head_dim]
         kv = (
-            self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-            .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            self.kv_b_proj(self.kv_a_layernorm(compressed_kv)) # lora_b升维
+            .view(batch_size, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             .transpose(1, 2)
         )
 
+        # kv: [batch_size, num_heads, seq_len, self.qk_nope_head_dim + self.v_head_dim]
+        # k_nope: [batch_size, num_heads, seq_len, self.qk_nope_head_dim]
+        # value_states: [batch_size, num_heads, seq_len, self.v_head_dim]
         k_nope, value_states = torch.split(
             kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
@@ -474,59 +500,72 @@ class MiniCPMAttention(nn.Module):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # cos, sin: [batch_size, kv_seq_len, v_head_dim]
+        cos, sin = self.rotary_emb.forward(value_states, seq_len=kv_seq_len)
 
+        # k_pe: [batch_size, head_num=1, q_len, qk_rope_head_dim]
+        # q_pe: [batch_size, num_heads, q_len, qk_rope_head_dim], rope的维度
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
-        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        # query_states: [batch_size, num_heads, q_len, q_head_dim]
+        query_states = k_pe.new_empty(batch_size, self.num_heads, q_len, self.q_head_dim) # new_empty()会在k_pe所在的device上申请内存，并且使用k_pe.dtype
+        # query_states前部分使用q_nope: [batch_size, num_heads, q_len, qk_nope_head_dim], 原始query向量
         query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+        # query_states后部分使用q_pe: [batch_size, num_heads, q_len, qk_rope_head_dim], 即rope向量
         query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
 
-        key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+        # key_states: [batch_size, num_heads=1, q_len, q_head_dim]
+        key_states = k_pe.new_empty(batch_size, self.num_heads, q_len, self.q_head_dim)
+        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope # 前部分使用k_nope,原始query向量
+        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe # 后半部分使用rope向量
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs) # 更新kv cache
 
+        # query_states: [batch_size, num_heads, q_len, q_head_dim]
+        # key_states: [batch_size, num_heads=1, q_len, q_head_dim]
+        #          => [batch_size, num_heads=1, q_head_dim, q_len]
+        # attn_weights:[batch_size, num_heads, q_len, kv_seq_len]
         attn_weights = (
             torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
         )
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        if attn_weights.size() != (batch_size, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f"Attention weights should be of size {(batch_size, self.num_heads, q_len, kv_seq_len)}, but is"
                 f" {attn_weights.size()}"
             )
+
         assert attention_mask is not None
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            if attention_mask.size() != (batch_size, 1, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention mask should be of size {(batch_size, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
+            # attn_weights:[batch_size, num_heads, q_len, kv_seq_len]
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # key_states: [batch_size, num_heads=1, kv_seq_len, q_head_dim]
+        # attn_output: [batch_size, num_heads,  q_len, q_head_dim]
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
+        if attn_output.size() != (batch_size, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
+                f"`attn_output` should be of size {(batch_size, self.num_heads, q_len, self.v_head_dim)}, but is"
                 f" {attn_output.size()}"
             )
 
+        # attn_output: [batch_size, num_heads,  q_len, q_head_dim]
+        # => [batch_size,  q_len, num_heads, q_head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
 
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+        # attn_output: [batch_size,  q_len, num_heads*q_head_dim]
+        attn_output = attn_output.reshape(batch_size, q_len, self.num_heads * self.v_head_dim)
 
+        # attn_output: [batch_size,  q_len, hidden_size]
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -1237,7 +1276,7 @@ class MiniCPM3Model(MiniCPM3PreTrainedModel):
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
+            last_hidden_state=hidden_states, # 使用下标0也可以获取
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
@@ -1321,7 +1360,7 @@ class MiniCPM3ForCausalLM(MiniCPM3PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs = self.model.forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,

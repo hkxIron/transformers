@@ -303,8 +303,8 @@ class DynamicCache(Cache):
 
     def __init__(self) -> None:
         super().__init__()
-        self.key_cache: List[torch.Tensor] = []
-        self.value_cache: List[torch.Tensor] = []
+        self.key_cache: List[torch.Tensor] = [] # 每个层有一个cache tensor, 每个tensor的大小为: [batch_size, num_heads, seq_len, head_dim]
+        self.value_cache: List[torch.Tensor] = [] # shape: [batch_size, num_heads, seq_len, head_dim]
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
 
     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
@@ -356,14 +356,15 @@ class DynamicCache(Cache):
             A tuple containing the updated key and value states.
         """
         # Update the number of seen tokens
-        if layer_idx == 0:
-            self._seen_tokens += key_states.shape[-2]
+        if layer_idx == 0: # 只对于第0层才更新 seen_tokens
+            self._seen_tokens += key_states.shape[-2] # key_states: [batch_size, num_heads, seq_len, head_dim]
 
         # Update the cache
-        if len(self.key_cache) <= layer_idx:
+        if len(self.key_cache) <= layer_idx: # 追加
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
-        else:
+        else: # 更新原有kv cache
+            # key_cache: [batch_size, num_heads, seq_len, head_dim]
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
 

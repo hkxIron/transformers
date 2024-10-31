@@ -5,7 +5,7 @@ use_lora=0
 
 #模型详见：https://hf-mirror.com/openbmb/MiniCPM3-4B/tree/main
 
-model_path="/home/hkx/data/work/hf_data_and_model/models/"
+model_path="/home/hkx/data/work/hf_data_and_model/models/MiniCPM3-4B"
 if [ $use_lora -eq 0 ];then
   python hkx_minicpm3_sft.py \
       --model_name_or_path ${model_path} \
