@@ -475,12 +475,12 @@ class MiniCPMAttention(nn.Module):
         # =>[batch_size, head_num=1, q_len, qk_rope_head_dim]
         k_pe = k_pe.view(batch_size, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
         # compressed_kv: [batch_size, seq_len, kv_lora_rank]
-        # lora_b升维 =>[batch_size, seq_len, num_heads*(self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim)]
+        # 对kv进行lora_b升维 =>[batch_size, seq_len, num_heads*(self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim)]
         # =>[batch_size, seq_len, num_heads*(self.qk_nope_head_dim + self.v_head_dim)]
         # .view=>[batch_size, seq_len, num_heads, self.qk_nope_head_dim + self.v_head_dim]
         # .transpose => [batch_size, num_heads, seq_len, self.qk_nope_head_dim + self.v_head_dim]
         kv = (
-            self.kv_b_proj(self.kv_a_layernorm(compressed_kv)) # lora_b升维
+            self.kv_b_proj(self.kv_a_layernorm(compressed_kv)) # 用lora_b对kv升维
             .view(batch_size, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             .transpose(1, 2)
         )
@@ -500,6 +500,7 @@ class MiniCPMAttention(nn.Module):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
         # cos, sin: [batch_size, kv_seq_len, v_head_dim]
         cos, sin = self.rotary_emb.forward(value_states, seq_len=kv_seq_len)
 
