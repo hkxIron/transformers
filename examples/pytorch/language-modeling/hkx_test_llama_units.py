@@ -55,7 +55,7 @@ def test_llama_forward():
     llama_model = LlamaModel(config=llama_config)
     batch,seq_len=2, 3 
     input_ids = torch.randint(low=0, high= llama_config.vocab_size, size=(batch, seq_len))
-    model_out: BaseModelOutputWithPast = llama_model(input_ids)
+    model_out: BaseModelOutputWithPast = llama_model.forward(input_ids)
     print("model_out shape:", model_out.last_hidden_state.shape)# torch.Size([2, 3, 2048])
     """
     LlamaModel(
@@ -170,8 +170,8 @@ def test_grad_norm():
 if __name__ == "__main__":
     print("args:", sys.argv)
     show_paths()
-    test_grad_norm()
+    test_llama_forward()
 
     if False:
         test_rope()
-        test_llama_forward()
+        test_grad_norm()

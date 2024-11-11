@@ -501,7 +501,7 @@ def get_scheduler(
     if optimizer is not None and isinstance(optimizer, LayerWiseDummyOptimizer):
         optimizer_dict = optimizer.optimizer_dict
         scheduler_dict = {}
-
+        # hkx_note:根据不的scheduler_type创建不同的优化函数
         for param in optimizer_dict.keys():
             scheduler_dict[param] = get_scheduler(
                 name,

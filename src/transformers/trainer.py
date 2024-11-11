@@ -1044,23 +1044,27 @@ class Trainer:
         Trainer's init through `optimizers`, or subclass and override this method (or `create_optimizer` and/or
         `create_scheduler`) in a subclass.
         """
+        # 创建optimizer
         self.create_optimizer()
         if IS_SAGEMAKER_MP_POST_1_10 and smp.state.cfg.fp16:
             # If smp >= 1.10 and fp16 is enabled, we unwrap the optimizer
             optimizer = self.optimizer.optimizer
         else:
             optimizer = self.optimizer
+        # 创建scheduler
         self.create_scheduler(num_training_steps=num_training_steps, optimizer=optimizer)
 
     def get_decay_parameter_names(self, model) -> List[str]:
         """
         Get all parameter names that weight decay will be applied to
 
+        weight_decay是排除layerNorm,以及bias之后的参数,如mlp,attention里的w
+
         Note that some models implement their own layernorm instead of calling nn.LayerNorm, weight decay could still
         apply to those modules since this function only filter out instance of nn.LayerNorm
         """
-        decay_parameters = get_parameter_names(model, ALL_LAYERNORM_LAYERS)
-        decay_parameters = [name for name in decay_parameters if "bias" not in name]
+        decay_parameters = get_parameter_names(model, forbidden_layer_types=ALL_LAYERNORM_LAYERS) # 排除layerNorm里的参数
+        decay_parameters = [name for name in decay_parameters if "bias" not in name] # 排除bias参数
         return decay_parameters
 
     def create_optimizer(self):
@@ -1073,22 +1077,25 @@ class Trainer:
         opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
 
         if self.optimizer is None:
+            #weight_decay是排除layerNorm, 以及bias之后的参数, 如mlp, attention里的w
             decay_parameters = self.get_decay_parameter_names(opt_model)
             optimizer_grouped_parameters = [
+                # 需要l2惩罚的参数
                 {
                     "params": [
                         p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
                     ],
-                    "weight_decay": self.args.weight_decay,
+                    "weight_decay": self.args.weight_decay, # l2惩罚的权重,torch.F.adam里会取'weight_decay'这个key的值
                 },
+                # 不需要l2惩罚的参数
                 {
                     "params": [
                         p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
                     ],
-                    "weight_decay": 0.0,
+                    "weight_decay": 0.0, # weight_decay权重设为0
                 },
             ]
-
+            # 如：Adamw
             optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
 
             # Overwrite `params` in case it's created by `get_optimizer_cls_and_kwargs`
@@ -1106,6 +1113,7 @@ class Trainer:
             if "optimizer_dict" in optimizer_kwargs:
                 optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
 
+            # eg: optimizer = torch.optim.Adam(model.parameters(), lr=config["base_lr"], betas=(0.9, 0.98), eps=1e-9)
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
             if optimizer_cls.__name__ == "Adam8bit":
@@ -1458,8 +1466,9 @@ class Trainer:
             num_training_steps (int): The number of training steps to do.
         """
         if self.lr_scheduler is None:
+            # hkx_note:创建lr_scheduler
             self.lr_scheduler = get_scheduler(
-                self.args.lr_scheduler_type,
+                self.args.lr_scheduler_type, # 默认是线性linear
                 optimizer=self.optimizer if optimizer is None else optimizer,
                 num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
                 num_training_steps=num_training_steps,
@@ -2091,6 +2100,7 @@ class Trainer:
         # FSDP-XLA, SageMaker MP/DP, DataParallel, IPEX
         use_accelerator_prepare = True if model is self.model else False
 
+        # hkx_note:如果启用了fsdp, deepspeed,则需要延迟创建optimizer与lr_scheduler
         if delay_optimizer_creation:
             if use_accelerator_prepare:
                 self._fsdp_qlora_plugin_updates()

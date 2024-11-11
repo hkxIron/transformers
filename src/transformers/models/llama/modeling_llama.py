@@ -96,7 +96,7 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         # attention_mask:[batch, sequence_length], 值为1的地方是有效token，为0的地方是padding_id
         # target_length=past_seen_token + seq_len+1
         # casual_mask:[sequence_length, target_length], casual_mask=0的地方是需要参与attention的地方
-        causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
+        causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device) # 注意：填充的为最小值
         if sequence_length != 1:
             causal_mask = torch.triu(causal_mask, diagonal=1) # 只保留上三角(upper)矩阵, 下三角全置0, diagonal=1使用主对角线上面第1条对角线
         # casual_mask: [sequence_length, target_length=seq_len+1]
@@ -778,6 +778,35 @@ class LlamaAttention(nn.Module):
         # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
+        """
+        eg:
+        attention_mask # 一个batch有4个样本，最后一个样本(第3个样本)最长，mask均为1
+        Out[10]:  
+        tensor([[0, 0, 0,  ..., 1, 1, 1],
+                [0, 0, 0,  ..., 1, 1, 1],
+                [0, 0, 0,  ..., 1, 1, 1],
+                [1, 1, 1,  ..., 1, 1, 1]])
+
+        causal_mask[1][0]>=0 # batch中第0个样本的attention_mask, 可以看到左边padding部分的mask均为False
+        Out[15]: 
+        tensor([[False, False, False,  ..., False, False, False],
+                [False, False, False,  ..., False, False, False],
+                [False, False, False,  ..., False, False, False],
+                ...,
+                [False, False, False,  ...,  True, False, False],
+                [False, False, False,  ...,  True,  True, False],
+                [False, False, False,  ...,  True,  True,  True]])
+
+        causal_mask[3][0]>=0 # batch中第3个样本的attention_mask，由于第3个样本最长，所以没有left_padding, 可以看到其mask为标准的下三角因果矩阵
+        Out[16]: 
+        tensor([[ True, False, False,  ..., False, False, False],
+                [ True,  True, False,  ..., False, False, False],
+                [ True,  True,  True,  ..., False, False, False],
+                ...,
+                [ True,  True,  True,  ...,  True, False, False],
+                [ True,  True,  True,  ...,  True,  True, False],
+                [ True,  True,  True,  ...,  True,  True,  True]])
+        """
         # attention_mask: [batch, 1, query_seq_len, key_seq_len],  因果注意力的下三角attention mask, 每次都会传入
         if attention_mask is not None:  # no matter the length, we just slice it
             key_seq_len = key_states.shape[-2]
@@ -1360,6 +1389,37 @@ class LlamaModel(LlamaPreTrainedModel):
         # attention_mask: [batch, sequence_length], 为同一batch中不同样本的长效长度，为0的位置是padding
         # input_embeds:[batch, sequence_length, hidden_size]
         # cache_position:[sequence_length]
+        # casual_mask: [batch, head_num=1, sequence_length, target_length=seq_len+1]
+        """
+        eg:
+        attention_mask # 一个batch有4个样本，最后一个样本(第3个样本)最长，mask均为1
+        Out[10]:  
+        tensor([[0, 0, 0,  ..., 1, 1, 1],
+                [0, 0, 0,  ..., 1, 1, 1],
+                [0, 0, 0,  ..., 1, 1, 1],
+                [1, 1, 1,  ..., 1, 1, 1]])
+        
+        causal_mask[1][0]>=0 # batch中第0个样本的attention_mask, 可以看到左边padding部分的mask均为False
+        Out[15]: 
+        tensor([[False, False, False,  ..., False, False, False],
+                [False, False, False,  ..., False, False, False],
+                [False, False, False,  ..., False, False, False],
+                ...,
+                [False, False, False,  ...,  True, False, False],
+                [False, False, False,  ...,  True,  True, False],
+                [False, False, False,  ...,  True,  True,  True]])
+                
+        causal_mask[3][0]>=0 # batch中第3个样本的attention_mask，由于第3个样本最长，所以没有left_padding, 可以看到其mask为标准的下三角因果矩阵
+        Out[16]: 
+        tensor([[ True, False, False,  ..., False, False, False],
+                [ True,  True, False,  ..., False, False, False],
+                [ True,  True,  True,  ..., False, False, False],
+                ...,
+                [ True,  True,  True,  ...,  True, False, False],
+                [ True,  True,  True,  ...,  True,  True, False],
+                [ True,  True,  True,  ...,  True,  True,  True]])
+            
+        """
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
@@ -1487,6 +1547,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # target_length=past_seen_token + seq_len+1
         # cache_position:[sequence_len]
         # input_tensor:[batch, sequence_len, hidden_size]
+        # casual_mask: [batch, 1, sequence_length, target_length=seq_len+1]
         causal_mask = _prepare_4d_causal_attention_mask_with_cache_position(
             attention_mask,
             sequence_length=sequence_length,
