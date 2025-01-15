@@ -618,6 +618,7 @@ glue_tasks_num_labels = {
     "wnli": 2,
 }
 
+# bert同时在很多任务上都有测试，所以需要一个字典来存储这些数据集的处理器
 glue_processors = {
     "cola": ColaProcessor,
     "mnli": MnliProcessor,

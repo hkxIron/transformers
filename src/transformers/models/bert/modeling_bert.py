@@ -1085,12 +1085,13 @@ class BertModel(BertPreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
 
-        use_sdpa_attention_masks = (
-            self.attn_implementation == "sdpa"
-            and self.position_embedding_type == "absolute"
-            and head_mask is None
-            and not output_attentions
-        )
+        # use_sdpa_attention_masks = (
+        #     self.attn_implementation == "sdpa"
+        #     and self.position_embedding_type == "absolute"
+        #     and head_mask is None
+        #     and not output_attentions
+        # )
+        use_sdpa_attention_masks = False
 
         # Expand the attention mask
         if use_sdpa_attention_masks:

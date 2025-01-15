@@ -717,12 +717,40 @@ class LlamaAttention(nn.Module):
 
             value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
             value_states = torch.cat(value_states, dim=-1)
-
         else:
-            # hidden_state:[batch_size, seq_len, hidden_size]
+            """
+            kv cache可能会影响最终的推理准确性，原因主要是影响了prefill阶段query的input shape,导致矩阵相乘时的精度误差
+            
+            1. 无kv cache时, 手动拼接input_ids, input_ids=hidden_states: [batch, seq_len, hidden_size]
+            for _ in range(5):
+                next_logits = model(input_ids)["logits"][:, -1:]
+                next_token_id = torch.argmax(next_logits, dim=-1)
+                # 没有kv cached的解码，需要手动将next_token_id与input_ids拼接起来
+                input_ids = torch.cat([input_ids, next_token_id], dim=-1)
+                print("shape of input_ids:", input_ids.shape) 
+                
+            2. 有kv cache时, 无需拼接input_ids, next_token_id = hidden_states: [batch, seq_len=1, hidden_size], 注意seq_len=1
+                past_key_values = None  # past_key_values is the key-value cache, kv cache初始化为None,后面动态增加
+                for _ in range(5):
+                    # 每次只输入下一个token
+                    next_logits, past_key_values = model(next_token_id, past_key_values=past_key_values, use_cache=True).to_tuple()
+                    # next_logits:[batch, seq_len, vocab_size]
+                    # -> [batch, last_token=1, vocab_size]
+                    next_logits = next_logits[:, -1:]
+                    next_token_id = torch.argmax(next_logits, dim=-1) 
+            
+            If you place a breakpoint inside the model, and see what happens with and without KV caches, you'll see:
+            1. During prefill (parsing the input prompt), the KV caches and the hidden states are exactly the same,
+                as the inputs contain the same values and shapes.
+            2. When generating one token at a time, you will see a divergence happening in the hidden states and
+                the QKV after operations like linear layers.  
+                我感觉应该是因为padding mask + softmax 造成的精度误差,此时query_len=1,而不是所有已输入token的length
+            see: https://github.com/huggingface/transformers/issues/25420
+            """
+            # hidden_state:[batch_size, seq_len, hidden_size], 注意：在推理的prefill阶段, hidden_state的shape:[batch_size, 1, hidden_size]
             # q_proj: [hidden_size, hidden_size=num_head*head_dim]
             # query_states: [batch_size, seq_len, hidden_size]
-            query_states = self.q_proj(hidden_states)
+            query_states = self.q_proj(hidden_states) # 对于bfloat16或float16时，seq_len不同会因为矩阵计算精度导致最终的query_states不同,最终导致是否kv cache的结果不同
             # k_proj, v_proj: [hidden_size, num_key_value_head*head_dim], 对于MHA而言，hidden_size=num_key_value_head*head_dim
             # hidden_state:[batch_size, seq_len, hidden_size]
             # key_states, value_states: [batch_size, num_key_value_head*head_dim]
@@ -755,7 +783,7 @@ class LlamaAttention(nn.Module):
         else:
             cos, sin = position_embeddings
 
-        # query_states:[batch_size, num_head, seq_len, head_dim]
+        # query_states:[batch_size, num_head, seq_len, head_dim], 在使用kvcache的推理阶段的step_by_step阶段，seq_len=1
         # key_states: [batch_size, num_key_value_heads, seq_len, head_dim]
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin) # 对 query,key应用rope,因为它们要进行内积
 
@@ -763,7 +791,10 @@ class LlamaAttention(nn.Module):
             # 如果启用了kv cache, 则更新KV cache
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            # 大模型推理阶段的prefill阶段,每次只有一个token_id, 因此此处的update会进行key,value与缓存的拼接
+            # prefilling key_states:[batch, num_key_value_heads, 1, head_dim]
+            # key_states after kv cache:[batch, num_key_value_heads, seq_len, head_dim]
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs) # 注意：update会改变 key_states
 
         # 如果是GQA,那么num_key_value_heads< num_heads,即key, value向量维度小于query
         # 因此，GQA中需要进行key/value复制,以适合query的大小
@@ -807,7 +838,8 @@ class LlamaAttention(nn.Module):
                 [ True,  True,  True,  ...,  True,  True, False],
                 [ True,  True,  True,  ...,  True,  True,  True]])
         """
-        # attention_mask: [batch, 1, query_seq_len, key_seq_len],  因果注意力的下三角attention mask, 每次都会传入
+        # 在推理阶段时：attention_mask:在推理的prefill阶段为：[batch, num_heads=1, query_seq_len, key_seq_len], 在后面step by step decoding时 [batch, num_heads=1, query_seq_len=1, key_seq_len]
+        # attention_mask: [batch, num_heads=1, query_seq_len, key_seq_len],  因果注意力的下三角attention mask, 每次都会传入
         if attention_mask is not None:  # no matter the length, we just slice it
             key_seq_len = key_states.shape[-2]
             causal_mask = attention_mask[:, :, :, : key_seq_len] # 此处的mask是0与-inf,0的地方参与attention, key_states.shape[-2]为seq_len
@@ -1369,6 +1401,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if (
             use_cache and not isinstance(past_key_values, Cache) and not self.training
         ):  # kept for BC (non `Cache` `past_key_values` inputs)
+            # 注意：training时都是类似prefill的形式，并不需要kv cache
             return_legacy_cache = True
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             logger.warning_once(
@@ -1376,6 +1409,14 @@ class LlamaModel(LlamaPreTrainedModel):
                 "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
             )
 
+        """
+        cache_position表示当前的input_ids中有多少个token,不论padding有多少个
+        
+        One important concept you need to know when writing your own generation loop, is cache_position. 
+        In case you want to reuse an already filled Cache object by calling forward(), you have to pass in a valid cache_position which will indicate 
+        the positions of inputs in the sequence. Note that cache_position is not affected by padding, and always adds one more position for each token. 
+        For example, if key/value cache contains 10 tokens (no matter how many of it is a pad token), the cache position for the next token should be torch.tensor([10]). 
+        """
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             input_seq_len = inputs_embeds.shape[1]

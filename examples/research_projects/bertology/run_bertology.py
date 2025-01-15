@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 def entropy(p):
     """Compute the entropy of a probability distribution"""
     plogp = p * torch.log(p)
-    plogp[p == 0] = 0
+    plogp[p == 0] = 0 # p=0或1时, 熵为0
     return -plogp.sum(dim=-1)
 
 
@@ -109,7 +109,7 @@ def compute_heads_importance(
                 masked_entropy = entropy(attn.detach()) * inputs["attention_mask"].float().unsqueeze(1)
                 attn_entropy[layer] += masked_entropy.sum(-1).sum(0).detach()
 
-        if compute_importance:
+        if compute_importance: # 所谓重要性，就是梯度的绝对值
             head_importance += head_mask.grad.abs().detach()
 
         # Also store our logits/labels if we want to compute metrics afterwards
@@ -418,11 +418,11 @@ def main():
 
     # Distributed and parallel training
     model.to(args.device)
-    if args.local_rank != -1:
+    if args.local_rank != -1: # 多机多卡
         model = nn.parallel.DistributedDataParallel(
             model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
         )
-    elif args.n_gpu > 1:
+    elif args.n_gpu > 1: # 单机多卡
         model = nn.DataParallel(model)
 
     # Print/save training arguments

@@ -700,6 +700,7 @@ class MixtralSparseMoeBlock(nn.Module):
     (1) drop tokens at the cost of reduced performance or (2) set
     capacity factor to number of experts and thus waste computation
     and memory on padding.
+
     """
 
     def __init__(self, config):
@@ -738,9 +739,11 @@ class MixtralSparseMoeBlock(nn.Module):
 
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
+        # 创建0-1 mask, 选一个需要要专家
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
         # Loop over all available experts in the model and perform the computation on each expert
+        # 对所有的专家进行计算
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
             idx, top_x = torch.where(expert_mask[expert_idx])
