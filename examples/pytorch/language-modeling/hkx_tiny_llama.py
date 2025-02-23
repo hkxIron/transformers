@@ -21,7 +21,7 @@ import numpy as np
 
 @my_decorator
 def test_llama_tokenzier():
-    model_path = '/home/hkx/data/work/hf_data_and_model/models/TinyStories-LLaMA2-20M-256h-4l-GQA'
+    model_path = '/home/hkx/data/work/hf_data_and_model/models/MoZhang96//TinyStories-LLaMA2-20M-256h-4l-GQA'
     tokenizer:LlamaTokenizer = LlamaTokenizer.from_pretrained(model_path, use_fast=False)
 
     print(f"pad_id:{tokenizer.pad_token_id}")
@@ -89,7 +89,7 @@ def get_batch_log_probs(logits: torch.FloatTensor, labels: torch.LongTensor, ave
         return log_prob_sum, valid_token_num
 @my_decorator
 def test_tiny_llama_forward_attention_mask():
-    model_path = '/home/hkx/data/work/hf_data_and_model/models/TinyStories-LLaMA2-20M-256h-4l-GQA'
+    model_path = '/home/hkx/data/work/hf_data_and_model/models/MoZhang96//TinyStories-LLaMA2-20M-256h-4l-GQA'
     tokenizer:LlamaTokenizer = LlamaTokenizer.from_pretrained(model_path, use_fast=False)
     model:LlamaForCausalLM = LlamaForCausalLM.from_pretrained(model_path)
     prompt='you are a assistant.'
@@ -139,7 +139,7 @@ def test_tiny_llama_forward_attention_mask():
 @my_decorator
 def test_tiny_llama_20M_generate():
     # 测试从huggface上下载的真实的小模型
-    model_path = '/home/hkx/data/work/hf_data_and_model/models/TinyStories-LLaMA2-20M-256h-4l-GQA'
+    model_path = '/home/hkx/data/work/hf_data_and_model/models/MoZhang96/TinyStories-LLaMA2-20M-256h-4l-GQA'
     #model_path = '/home/hkx/data/work/models/chinese-baby-llama2'
     tokenizer:LlamaTokenizer = LlamaTokenizer.from_pretrained(model_path, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(model_path)
