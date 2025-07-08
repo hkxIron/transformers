@@ -1,3 +1,8 @@
+# casual language model
+# 因果语言模型, 不使用hf 的Trainer
+
+
+
 #!/usr/bin/env python
 # coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
@@ -564,6 +569,7 @@ def main():
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
         accelerator.init_trackers("clm_no_trainer", experiment_config)
 
+    # 注意:此处并没有使用hf Trainer类,而是自已重写了Trainer函数
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -701,6 +707,7 @@ def main():
     if args.with_tracking:
         accelerator.end_training()
 
+    # 保存模型
     if args.output_dir is not None:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
