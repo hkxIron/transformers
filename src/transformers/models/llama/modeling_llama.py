@@ -98,25 +98,35 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         # casual_mask:[sequence_length, target_length], casual_mask=0的地方是需要参与attention的地方
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device) # 注意：填充的为最小值
         if sequence_length != 1:
-            causal_mask = torch.triu(causal_mask, diagonal=1) # 只保留上三角(upper)矩阵, 下三角全置0, diagonal=1使用主对角线上面第1条对角线
-        # casual_mask: [sequence_length, target_length=seq_len+1]
+            causal_mask = torch.triu(causal_mask, diagonal=1) # 只保留上三角(upper)矩阵原始的最小值, 下三角全置0, diagonal=1使用主对角线上面第1条对角线
+
+        # casual_mask: [sequence_length, target_length=seq_len+1], 将超过cache_position的位置全mask为0
         causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
         # casual_mask: [sequence_length, target_length=seq_len+1]
         # -> [batch, 1, sequence_length, target_length=seq_len+1]
         causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1) # expand会在该维度复制
         if attention_mask is not None: # attention_mask:[batch, sequence_length]
             causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+            # attention_mask: (batch_size, key_value_length)
             mask_length = attention_mask.shape[-1]
+
+            """
             # causal_mask:值为0的地方为需要attention的地方,值为-inf为不需要计算的地方
             # attention_mask:值为0的地方为不需要计算的地方，值为1的地方为需要计算的地方
             # 两者相加有如下几种情况：
-            # casual_mask(0)+attn_mask(0)=0, 不参与计算，需要额外mask
-            # casual_mask(0)+attn_mask(1)=1, 需要参与计算, 无需额外mask
-            # casual_mask(-inf)+attn_mask(0)=-inf, 不参与计算，无需额外mask
-            # casual_mask(-inf)+attn_mask(1)=-inf, 不参与计算，无需额外mask
+            # casual_mask(0)+attn_mask(0)=0, 不参与计算， 即为padding_mask=0
+            # casual_mask(0)+attn_mask(1)=1, 需要参与计算, 即为padding_mask=0
+            # casual_mask(-inf)+attn_mask(0)=-inf, 不参与计算，即为padding_mask=0
+            # casual_mask(-inf)+attn_mask(1)=-inf, 不参与计算，即为padding_mask=0
+            """
+            # causal_mask: (batch_size, 1, sequence_length, target_length=seq_len+1)
+            # attention_mask: (batch_size, key_value_length)
+            # => attention_mask: (batch_size, head_num=1, query_length=1, key_value_length)
+            # padding_mask: (batch_size, head_num=1, seq_len, target_length=seq_len+1)
             padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :] # attention_mask:[batch,1,1, sequence_length]
             padding_mask = padding_mask == 0
-            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(padding_mask, min_dtype)
+            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length]\
+                .masked_fill(padding_mask, value=min_dtype) # 将padding位置mask为-inf
     # casual_mask: [batch, 1, sequence_length, target_length=seq_len+1]
     return causal_mask
 
@@ -231,7 +241,8 @@ class LlamaRotaryEmbedding(nn.Module):
 
         # Core RoPE block
         # position_ids: [batch, sequence_length]
-        # inv_freq shape: [dim/2], 其值为: 1 / 10000 ^ (even_dim_index / dim)
+        # inv_freq shape: [dim/2], 其值为: 1 / 10000 ^ (even_dim_index / dim) ,even偶数
+        # eg: [1/10000^(0/dim), 1/10000^(2/dim), 1/10000^(4/dim), ... , 1/10000^((dim/2-2)/dim), 1/10000^((dim/2-1)/dim)]
         # => [1, dim/2, 1],其中dim=head_dim
         # inv_freq_expand:[batch, dim/2, 1], expand只适用于复制维度为1的
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
@@ -239,21 +250,17 @@ class LlamaRotaryEmbedding(nn.Module):
         # position_ids: [batch_size, sequence_length]
         # position_ids_expanded: [batch, 1, sequence_length]
         position_ids_expanded = position_ids[:, None, :].float()
+
         # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            # inv_freq_expand:[batch, dim/2, 1], 其值为: 1 / 10000 ^ (even_dim_index / dim)
-            # position_ids_expanded: [batch, 1, seq_len],
-            # freqs: [batch, dim/2, seq_len]
-            # 转置 => [batch, seq_len, dim/2]
-            # 即公式里的：pos / (10000^(2*i/dim)),
-            # position_embed(m) = e^(j*m*theta) = e^(j*m/[10000^(2i/dim)]),其中j为虚数单位
             """
             inv_freq @ position_ids的物理意义是对batch的每条样本都将inv_freq向量复制一份
             
             freqs: 在最后一维head_dim维
             [batch, seq_len, head_dim/2]
+
             freqs示例数据： 
             [batch, seq_len=m, [m*theta0,
                                 m*theta1,
@@ -263,15 +270,27 @@ class LlamaRotaryEmbedding(nn.Module):
                                 m*theta(head_dim//2-1)
                                 ]]
             """
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            # inv_freq_expand:[batch, dim/2, 1], 其值为: 1 / 10000 ^ (even_dim_index / dim)
+            # position_ids_expanded: [batch, 1, seq_len],
+            # => 
+            # freqs: [batch, dim/2, seq_len]
+            # transpose转置 => [batch, seq_len, dim/2]
+
+            # freqs = pos / (10000^(2*i/dim)),
+            # position_embed(m) = e^(j*m*theta) = e^(j*m/[10000^(2i/dim)]),其中j为虚数单位
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2) # 这里为batch matrix multiplication
+
             # freqs: [batch, seq_len, dim/2]
+            # =>
             # emb:  [batch, seq_len, dim]
             emb = torch.cat((freqs, freqs), dim=-1)
+
             """
             cos: 在最后一维dim维
             [batch, seq_len, dim]
             示例数据： 
             [batch, seq_len==m, [
+                                # 前半部分
                                 cos(m*theta0),
                                 cos(m*theta1),
                                 cos(m*theta2),
@@ -279,6 +298,7 @@ class LlamaRotaryEmbedding(nn.Module):
                                 cos(m*theta(head_dim//2-2)),
                                 cos(m*theta(head_dim//2-1)),
                                 ---------- 
+                                # 后半部分
                                 cos(m*theta0),
                                 cos(m*theta1),
                                 cos(m*theta2),
@@ -291,6 +311,7 @@ class LlamaRotaryEmbedding(nn.Module):
             [batch, seq_len==m, dim]
             示例数据： 
             [batch, seq_len=m, [
+                                # 前半部分
                                 sin(m*theta0),
                                 sin(m*theta1),
                                 sin(m*theta2),
@@ -298,6 +319,7 @@ class LlamaRotaryEmbedding(nn.Module):
                                 sin(m*theta(head_dim//2-2)),
                                 sin(m*theta(head_dim//2-1)),
                                 ---------- 
+                                # 后半部分
                                 sin(m*theta0),
                                 sin(m*theta1),
                                 sin(m*theta2),
@@ -342,7 +364,10 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
 
 
 def rotate_half(x:torch.Tensor):
-    """Rotates half the hidden dims of the input."""
+    """
+    Rotates half the hidden dims of the input.
+    将x的前后半部分进行交换， 然后将前半部分取反 
+    """
     # x: [batch, num_head, seq_len, head_dim]
     x1 = x[..., : x.shape[-1] // 2] # 最后一维取前半部分
     x2 = x[..., x.shape[-1] // 2 :] # 最后一维取后半部分
@@ -395,6 +420,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     [batch, seq_len, dim]
     示例数据： 
     [batch, seq_len=m, [
+                        # 前半部分
                         cos(m*theta0),
                         cos(m*theta1),
                         cos(m*theta2),
@@ -402,6 +428,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
                         cos(m*theta(head_dim//2-2)),
                         cos(m*theta(head_dim//2-1)),
                         ---------- 
+                        # 后半部分
                         cos(m*theta0),
                         cos(m*theta1),
                         cos(m*theta2),
@@ -411,7 +438,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
                         ]]
     """
     # cos, sin: [batch, seq_len, head_dim]
-    # =>   [batch, num_head=1, seq_len, head_dim]
+    # =>        [batch, num_head=1, seq_len, head_dim]
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
@@ -450,7 +477,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
                         ]]
     ]    
     
-    rotate_half(q): 
+    rotate_half(q): 将q的前后半部分进行交换， 然后将前半部分取反 
     [batch==0, num_head==0, seq_len==0, head_dim=[-q(dim/2+1),
                                                  -q(dim/2+2),
                                                  -q(dim/2+3),
@@ -481,7 +508,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
                         sin(m*theta(head_dim//2-2)),
                         sin(m*theta(head_dim//2-1))
                         ]]
-                        
+
+
+    ====>                    
+
     由q_embed = (q * cos) + (rotate_half(q) * sin)可得如下矩阵，
     q_embed:
     [batch==0, num_head==0, seq_len==0, head_dim= [ 
@@ -515,7 +545,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     
     2. 为何hf不采用llama中的interleaved的格式呢？
      - 最重要的是因为许可证的原因licence
-     - 其次, Eleuther's Rope 是等价的, 并且op算子更少, 因此效率更高
+     - 其次, Eleuther's Rope 是等价的, 并且op算子更少(不需要复数算子), 因此效率更高
     
     详细讨论见： 
     https://github.com/huggingface/transformers/issues/25199
@@ -523,11 +553,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     
     theta值为: [batch, dim/2, 1] = 1 / 10000 ^ (even_dim_index / dim)
     
-    RoFormer中的Rope
+    原始论文RoFormer中的Rope
     = [q0, q1, q2, ..., q(d-2), q(d-1)] .* [cos(m*theta0), cos(m*theta0), cos(m*theta1),cos(m*theta1), ..., cos(m*theta(head_dim/2)),cos(m*theta(dim/2))]  .*代表逐元素相乘
     + [-q1,q0,-q3, ...,-q(d-1), q(d-2)] .* [sin(m*theta0), sin(m*theta0), sin(m*theta1),sin(m*theta1), ..., sin(m*theta(head_dim/2)),sin(m*theta(dim/2))]
     = [
-       q0*cos(m*theta0)-q1*sin(m*theta0), # 即[q0,q1]作为复向量,然后对此复向量旋转m*theta0角度
+       q0*cos(m*theta0)-q1*sin(m*theta0), # 即[q0,q1]作为复向量,然后对此复向量逆时针旋转m*theta0角度
        q1*cos(m*theta0)+q0*sin(m*theta0), # 即[q0,q1]作为复向量
        
        q2*cos(m*theta1)-q3*sin(m*theta1),
@@ -542,13 +572,15 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     # cos:[batch, num_head=1, seq_len, head_dim]
     # q_embed: [batch, num_head, seq_len, head_dim]
     # k_embed: [batch, num_head, seq_len, head_dim]
+
+    #rotate_half: 将q的前后半部分进行交换， 然后将前半部分取反 
     q_embed = (q * cos) + (rotate_half(q) * sin) # GPT-NeoX style RoPE, 即half-style rope
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
 """
-我已盏过图，的确如此
+我已看过图，的确如此
 SiLU 函数将输入值x乘以 sigmoid(x) 函数的输出，其效果是在正值上非饱和，
 负值上平滑并接近于零。与 ReLU 函数类似，SiLU 函数也能够创建非线性决策边界，
 但它允许一些信息（即使是负值）传递，而不是像 ReLU 那样将所有负值置为零，这种特性可以帮助减轻梯度消失问题。
@@ -633,9 +665,11 @@ def repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
     # => [batch, num_key_value_heads, 1, seq_len, head_dim]
     # => [batch, num_key_value_heads, repeats, seq_len, head_dim]
     """
-    expand()函数可以将张量广播到新的形状。 注意：只能对维度值为1的维度进行扩展，无需扩展的维度，维度值不变，对应位置可写上原始维度大小或直接写作-1；且扩展的Tensor不会分配新的内存，只是原来的基础上创建新的视图并返回，返回的张量内存是不连续的。类似于numpy中的broadcast_to函数的作用。如果希望张量内存连续，可以调用contiguous函数。
+    expand()函数可以将张量广播到新的形状。 
+    注意：只能对维度值为1的维度进行扩展，无需扩展的维度，维度值不变，对应位置可写上原始维度大小或直接写作-1；且扩展的Tensor不会分配新的内存，只是原来的基础上创建新的视图并返回，返回的张量内存是不连续的。
+    类似于numpy中的broadcast_to函数的作用。如果希望张量内存连续，可以调用contiguous函数。
     """
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, repeats, seq_len, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, repeats, seq_len, head_dim) # 复制多份
     return hidden_states.reshape(batch, num_key_value_heads * repeats, seq_len, head_dim)
 
 
@@ -661,10 +695,11 @@ class LlamaAttention(nn.Module):
         # num_key_value_heads=1时，为multi query attention(MQA), 即所有query共享一个key
         # num_key_value_heads=num_attention_heads时，为原始的multi head attention(MHA)
         # num_key_value_heads<num_attention_heads时，为group query attention(GQA), 每个group大小为num_key_value_group_size
-        self.num_key_value_heads = config.num_key_value_heads # 有多少个key/value head,默认为num_attention_heads=32
-        # 假设num_head=32, num_key_value_heads=16, 则：num_key_value_group_size=2,即2个head为一组
+        self.num_key_value_heads = config.num_key_value_heads # 有多少个key/value head,默认为num_attention_heads=32, 有多少个key/value head group
+
+        # 假设num_head=32, num_key_value_heads=16, 则：num_key_value_group_size=2,即2个head为一组, 即一个组里有多少个key/value head
         # 总共只有16个不同的kv了，kv cache大小节省了一半内存
-        self.num_key_value_group_size = self.num_heads // self.num_key_value_heads # 每个GQA中组的大小(group size),后面组大小为多少就将kv复帛多少份
+        self.num_key_value_group_size = self.num_heads // self.num_key_value_heads # 每个GQA中组的大小(group size),后面组大小为多少就将kv复制多少份
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         # 默认即为因果推断
@@ -692,7 +727,7 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None, # 困果注意力的下三角attention mask , 已叠加样本组成batch时指示非padding与padding部分, padding处mask=0, 非padding处mask=1
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: Optional[DynamicCache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -767,8 +802,6 @@ class LlamaAttention(nn.Module):
         key_states = key_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # cos:[batch, seq_len, dim]
-        # sin:[batch, seq_len, dim]
         if position_embeddings is None:
             # 如果位置编码为空，使用rope计算位置编码
             logger.warning_once(
@@ -781,6 +814,8 @@ class LlamaAttention(nn.Module):
             # cos, sin: [batch, seq_len, dim]
             cos, sin = self.rotary_emb.forward(value_states, position_ids)
         else:
+            # cos:[batch, seq_len, dim]
+            # sin:[batch, seq_len, dim]
             cos, sin = position_embeddings
 
         # query_states:[batch_size, num_head, seq_len, head_dim], 在使用kvcache的推理阶段的step_by_step阶段，seq_len=1
@@ -791,27 +826,34 @@ class LlamaAttention(nn.Module):
             # 如果启用了kv cache, 则更新KV cache
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            # 大模型推理阶段的prefill阶段,每次只有一个token_id, 因此此处的update会进行key,value与缓存的拼接
-            # prefilling key_states:[batch, num_key_value_heads, 1, head_dim]
+            # 大模型推理阶段使用kvcache后,每次只有一个token_id输入, 因此此处的update会进行key,value与缓存的拼接
+            # key_states:[batch, num_key_value_heads, 1, head_dim]
+            # =>
             # key_states after kv cache:[batch, num_key_value_heads, seq_len, head_dim]
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs) # 注意：update会改变 key_states
+            key_states, value_states = past_key_value.update(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs) # 注意：update会改变 key_states
 
         # 如果是GQA,那么num_key_value_heads< num_heads,即key, value向量维度小于query
         # 因此，GQA中需要进行key/value复制,以适合query的大小
-        # 所以，GQA并没有减少attention时的计算量，只是减少了推理阶段kv cache的内存大小
+        # NOTE: 所以，GQA并没有减少attention时的计算量，只是减少了推理阶段kv cache的内存大小!!!
         # key_states, value_states: [batch_size, num_key_value_heads, seq_len, head_dim]
         # -> [batch_size, num_heads, seq_len, head_dim]
-        key_states = repeat_kv(key_states, self.num_key_value_group_size)
+        key_states = repeat_kv(key_states, self.num_key_value_group_size) # group有多大，就对key/value复制多少份
         value_states = repeat_kv(value_states, self.num_key_value_group_size)
 
-        # 所以可以看出，无论是MQA,GQA,它们最后都会进行kv复制，恢复成MQA的shape后再进行attention!!!
+        # 所以可以看出，无论是MQA,GQA,它们最后都会进行kv复制，恢复成MHA的shape后再进行attention!!!
         # query_states, key_states: [batch_size, num_heads, seq_len, head_dim]
+        # key_states: [batch_size, num_heads, seq_len, head_dim] 
         # attn_weights: [batch_size, num_heads, query_seq_len, key_seq_len]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         """
         eg:
-        attention_mask # 一个batch有4个样本，最后一个样本(第3个样本)最长，mask均为1
+        样本0: I was happy
+        样本1：I sell a car
+        样本2：I think that I am happy
+        样本3：I think that I was born in china.
+
+        attention_mask # 一个batch有4个样本,第1个样本最短,长度为3，最后一个样本(第3个样本)最长，mask均为1
         Out[10]:  
         tensor([[0, 0, 0,  ..., 1, 1, 1],
                 [0, 0, 0,  ..., 1, 1, 1],
@@ -838,8 +880,9 @@ class LlamaAttention(nn.Module):
                 [ True,  True,  True,  ...,  True,  True, False],
                 [ True,  True,  True,  ...,  True,  True,  True]])
         """
-        # 在推理阶段时：attention_mask:在推理的prefill阶段为：[batch, num_heads=1, query_seq_len, key_seq_len], 在后面step by step decoding时 [batch, num_heads=1, query_seq_len=1, key_seq_len]
-        # attention_mask: [batch, num_heads=1, query_seq_len, key_seq_len],  因果注意力的下三角attention mask, 每次都会传入
+        # 在推理阶段时：attention_mask:在推理的prefill阶段为：[batch, num_heads=1, query_seq_len, key_seq_len], 
+        # 在后面step by step decoding时 [batch, num_heads=1, query_seq_len=1, key_seq_len]
+        # attention_mask: [batch, num_heads=1, query_seq_len, key_seq_len],  因果注意力的下三角attention mask, 每次都会传入, 但每个head的mask都一样
         if attention_mask is not None:  # no matter the length, we just slice it
             key_seq_len = key_states.shape[-2]
             causal_mask = attention_mask[:, :, :, : key_seq_len] # 此处的mask是0与-inf,0的地方参与attention, key_states.shape[-2]为seq_len
@@ -1172,7 +1215,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states) # [batch, seq_len, hidden_size]
 
         # T1.2 Casual Masked Self Attention(因果attention)
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value = self.self_attn.forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1344,7 +1387,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # 注意：padding_id的embedding不会被更新
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
         # 多层decoder layer
-        self.layers = nn.ModuleList(
+        self.layers:List[LlamaDecoderLayer] = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1429,6 +1472,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # 因果注意力mask
         # attention_mask: [batch, sequence_length], 为同一batch中不同样本的长效长度，为0的位置是padding
         # input_embeds:[batch, sequence_length, hidden_size]
+        # =>
         # cache_position:[sequence_length]
         # casual_mask: [batch, head_num=1, sequence_length, target_length=seq_len+1]
         """
@@ -1496,7 +1540,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_embeddings,
                 )
             else:
-                layer_outputs = decoder_layer(
+                layer_outputs = decoder_layer.forward(
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
@@ -1583,8 +1627,9 @@ class LlamaModel(LlamaPreTrainedModel):
                 else past_seen_tokens + sequence_length + 1
             )
 
+        # NOTE:将2D的attention_mask转换为4D的attention_mask
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        # attention_mask:None
+        # attention_mask:[batch, sequence_length]
         # target_length=past_seen_token + seq_len+1
         # cache_position:[sequence_len]
         # input_tensor:[batch, sequence_len, hidden_size]

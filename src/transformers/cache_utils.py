@@ -303,7 +303,8 @@ class DynamicCache(Cache):
 
     def __init__(self) -> None:
         super().__init__()
-        self.key_cache: List[torch.Tensor] = [] # 每个层有一个cache tensor, 每个tensor的大小为: [batch_size, num_heads, seq_len, head_dim]
+        # key_cache: layer_number * Tensor[batch_size, num_heads, seq_len, head_dim]
+        self.key_cache: List[torch.Tensor] = [] # 每个layer层的每个key/value有一个cache tensor, 每个tensor的大小为: [batch_size, num_heads, seq_len, head_dim]
         self.value_cache: List[torch.Tensor] = [] # shape: [batch_size, num_heads, seq_len, head_dim]
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
 
@@ -360,11 +361,13 @@ class DynamicCache(Cache):
             self._seen_tokens += key_states.shape[-2] # key_states: [batch_size, num_heads, seq_len, head_dim]
 
         # Update the cache
-        if len(self.key_cache) <= layer_idx: # 追加
+        if len(self.key_cache) <= layer_idx: # 追加一个新加的layer的key/value states, 即增加一层网络
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
-        else: # 更新原有kv cache
+
+        else: # 更新原有kv cache, 增加kv cache的序列的长度
             # key_cache: [batch_size, num_heads, seq_len, head_dim]
+            # NOTE: 注意：每次都是concat
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
 

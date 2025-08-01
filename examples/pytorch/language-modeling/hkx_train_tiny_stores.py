@@ -236,6 +236,19 @@ def load_model_and_infer():
         "Once upon a time, in a beautiful garden, there lived a little black dog named jack."
     )
 
+def load_model_and_infer():
+    # 确实可以预测
+    model_path = "/home/hkx/data/work/hf_data_and_model/models/MoZhang96/TinyStories-LLaMA2-20M-256h-4l-GQA"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+    model.eval()
+    inference(
+        model,
+        tokenizer,
+        "Once upon a time, in a beautiful garden, there lived a little black dog named jack."
+    )
+
+
 def test_my_data_collator():
     tokenizer = AutoTokenizer.from_pretrained('/home/hkx/data/work/hf_data_and_model/models/NousResearch/Llama-2-7b-hf')
     # DataCollatorForLanguageModeling
