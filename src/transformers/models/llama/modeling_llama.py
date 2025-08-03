@@ -270,16 +270,18 @@ class LlamaRotaryEmbedding(nn.Module):
                                 m*theta(head_dim//2-1)
                                 ]]
             """
-            # inv_freq_expand:[batch, dim/2, 1], 其值为: 1 / 10000 ^ (even_dim_index / dim)
+            
+            # inv_freq_expand, 即为其中的 theta(dim_index):[batch, dim/2, 1], 其值为: 1 / 10000 ^ (even_dim_index / dim)
             # position_ids_expanded: [batch, 1, seq_len],
             # => 
             # freqs: [batch, dim/2, seq_len]
             # transpose转置 => [batch, seq_len, dim/2]
 
-            # freqs = pos / (10000^(2*i/dim)),
-            # position_embed(m) = e^(j*m*theta) = e^(j*m/[10000^(2i/dim)]),其中j为虚数单位
+            # freqs = position / (10000^(2*dim_idx/dim)),
+            # position_embed(m) = e^(j*m*theta) = e^(j*m/[10000^(2*dim_idx/dim)]),其中j为虚数单位, m为token位置
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2) # 这里为batch matrix multiplication
 
+            # 前半部分与后半部分拼接
             # freqs: [batch, seq_len, dim/2]
             # =>
             # emb:  [batch, seq_len, dim]
@@ -416,6 +418,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
 
     """
+    # 每个hidden_dim上的单位旋转角度为：theta(dim_index):[batch, dim/2, 1], 其值为: 1 / 10000 ^ (even_dim_index / dim)
+
     cos: 在最后一维dim维
     [batch, seq_len, dim]
     示例数据： 
@@ -511,6 +515,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
     ====>                    
+    正交旋转矩阵R(x):
+    [
+      [cos(x), -sin(x)],
+      [sin(x),  cos(x)]
+    ]
 
     由q_embed = (q * cos) + (rotate_half(q) * sin)可得如下矩阵，
     q_embed:
@@ -811,6 +820,8 @@ class LlamaAttention(nn.Module):
                 "removed and `position_embeddings` will be mandatory."
             )
             # position_ids: [batch_size, seq_len]
+            # 每个hidden_dim上的单位旋转角度为：theta(dim_index):[batch, dim/2, 1], 其值为: 1 / 10000 ^ (even_dim_index / dim)
+            # =>
             # cos, sin: [batch, seq_len, dim]
             cos, sin = self.rotary_emb.forward(value_states, position_ids)
         else:
@@ -818,6 +829,7 @@ class LlamaAttention(nn.Module):
             # sin:[batch, seq_len, dim]
             cos, sin = position_embeddings
 
+        # NOTE:必须要在attention内积之前应用rope
         # query_states:[batch_size, num_head, seq_len, head_dim], 在使用kvcache的推理阶段的step_by_step阶段，seq_len=1
         # key_states: [batch_size, num_key_value_heads, seq_len, head_dim]
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin) # 对 query,key应用rope,因为它们要进行内积
