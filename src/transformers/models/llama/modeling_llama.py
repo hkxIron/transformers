@@ -652,7 +652,7 @@ class LlamaMLP(nn.Module):
             # down_proj:[batch, seq_len, hidden_size], 将各张量结果相加, 得到最终矩阵相乘结果
             down_proj = sum(down_proj)
         else:
-            # 注意：现在是gate后加激活函数，up里面没有
+            # NOTE：llama中是gate后加激活函数，up里面没有
             # y = down( silu(gate(x)) * up(x) )
             down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
@@ -701,9 +701,31 @@ class LlamaAttention(nn.Module):
         self.hidden_size = config.hidden_size # hidden_size:4096
         self.num_heads = config.num_attention_heads # num_heads=32
         self.head_dim = self.hidden_size // self.num_heads # head_dim=128
-        # num_key_value_heads=1时，为multi query attention(MQA), 即所有query共享一个key
-        # num_key_value_heads=num_attention_heads时，为原始的multi head attention(MHA)
-        # num_key_value_heads<num_attention_heads时，为group query attention(GQA), 每个group大小为num_key_value_group_size
+        """
+         若：hidden_size=4096, num_heads=32, head_dim=128
+
+         1.MHA: 
+            num_key_value_heads=num_attention_heads=32时，为原始的multi head attention(MHA)
+            k_proj/v_proj: [hidden_size=4096, num_key_value_heads*head_dim=32*128=4096]
+            q_proj: [hidden_size=4096, num_attention_heads*head_dim=32*128=4096]
+
+         2.MQA: 
+            num_key_value_heads=1时，为multi query attention(MQA), 即所有head的query共享一个key/value
+            num_key_value_group_size = num_attention_heads // num_key_value_heads=32//1=32, 即全部32个head共享一个key/value
+            k_proj/v_proj: [hidden_size=4096, num_key_value_heads*head_dim=1*128=128],注意：128<head_dim=4096
+            q_proj: [hidden_size=4096, num_attention_heads*head_dim=32*128=4096]
+
+         3. GQA:
+            num_key_value_heads=16<num_attention_heads=32时，为group query attention(GQA), 每个group大小为 num_key_value_group_size
+
+            若两个head的query共享一个key/value, 即num_key_value_group_size=2, 
+            num_key_value_heads=num_attention_heads//num_key_value_heads =16 < num_attention_heads=32
+
+            k_proj/v_proj: [hidden_size=4096, num_key_value_heads*head_dim=16*128=2048],注意：2048<head_dim=4096
+            q_proj: [hidden_size=4096, num_attention_heads*head_dim=32*128=4096]
+
+        
+        """
         self.num_key_value_heads = config.num_key_value_heads # 有多少个key/value head,默认为num_attention_heads=32, 有多少个key/value head group
 
         # 假设num_head=32, num_key_value_heads=16, 则：num_key_value_group_size=2,即2个head为一组, 即一个组里有多少个key/value head
@@ -721,12 +743,13 @@ class LlamaAttention(nn.Module):
             )
         # q_proj: [hidden_size, hidden_size=num_head*head_dim]
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        # 如果是GQA,那么num_key_value_heads< num_heads,即key, value向量维度小于query
-        # k_proj, v_proj: [hidden_size, num_key_value_head*head_dim]
+        # 如果是GQA/MQA,那么num_key_value_heads< num_heads
+        # 即key, value向量维度小于query
+        # NOTE: k_proj, v_proj: [hidden_size, num_key_value_head*head_dim], GQA/MQA中 k_proj/v_proj: 其维度小于q_proj = hidden_size
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         # q_proj: [hidden_size, hidden_size]
-        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias) # 一般的没有bias
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -791,6 +814,7 @@ class LlamaAttention(nn.Module):
                 我感觉应该是因为padding mask + softmax 造成的精度误差,此时query_len=1,而不是所有已输入token的length
             see: https://github.com/huggingface/transformers/issues/25420
             """
+            # NOTE:先要进行Wq,Wk,Wk的变换，再进行rope+ attention
             # hidden_state:[batch_size, seq_len, hidden_size], 注意：在推理的prefill阶段, hidden_state的shape:[batch_size, 1, hidden_size]
             # q_proj: [hidden_size, hidden_size=num_head*head_dim]
             # query_states: [batch_size, seq_len, hidden_size]
@@ -806,7 +830,7 @@ class LlamaAttention(nn.Module):
         # -> [batch_size, num_head, seq_len, head_dim]
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         # query_states, value_states: [batch_size, seq_len, num_key_value_heads*head_dim]
-        # -> [batch_size, seq_len, num_key_value_heads, head_dim]
+        # -> [batch_size, seq_len, num_key_value_heads, head_dim], MQA, GQA中num_key_value_heads< num_heads=32
         # -> [batch_size, num_key_value_heads, seq_len, head_dim]
         key_states = key_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -847,8 +871,10 @@ class LlamaAttention(nn.Module):
         # 如果是GQA,那么num_key_value_heads< num_heads,即key, value向量维度小于query
         # 因此，GQA中需要进行key/value复制,以适合query的大小
         # NOTE: 所以，GQA并没有减少attention时的计算量，只是减少了推理阶段kv cache的内存大小!!!
+        # NOTE: MQA, GQA中num_key_value_heads< num_heads=32
+        # 在MQA中，query的大小为num_heads, key,value的大小为num_key_value_heads=1, 需要复制 num_key_value_group_size=num_heads//_num_key_value_heads 份
         # key_states, value_states: [batch_size, num_key_value_heads, seq_len, head_dim]
-        # -> [batch_size, num_heads, seq_len, head_dim]
+        # -> [batch_size, num_heads, seq_len, head_dim], 注意：这里最后复制为query相同的shape了
         key_states = repeat_kv(key_states, self.num_key_value_group_size) # group有多大，就对key/value复制多少份
         value_states = repeat_kv(value_states, self.num_key_value_group_size)
 
@@ -860,37 +886,40 @@ class LlamaAttention(nn.Module):
 
         """
         eg:
-        样本0: I was happy
-        样本1：I sell a car
+        样本0：I sell a car
+        样本1:I was happy
         样本2：I think that I am happy
         样本3：I think that I was born in china.
 
-        attention_mask # 一个batch有4个样本,第1个样本最短,长度为3，最后一个样本(第3个样本)最长，mask均为1
+        attention_mask # 一个batch有4个样本,第0个样本最长为4,第1个样本长度为3，最后一个样本(第3个样本)最长，mask均为1
         Out[10]:  
-        tensor([[0, 0, 0,  ..., 1, 1, 1],
-                [0, 0, 0,  ..., 1, 1, 1],
-                [0, 0, 0,  ..., 1, 1, 1],
-                [1, 1, 1,  ..., 1, 1, 1]])
+        tensor([[0, 0, 0,  0,  1, 1, 1, 1], # smaple[0].len=4
+                [0, 0, 0,  0,  0, 1, 1, 1], # sample[1].len=3
+                [0, 0, 1,  1,  1 , 1, 1, 1], # sample[2].len=6
+                [1, 1, 1,  1,  1, 1, 1, 1]]) # sample[3].len=8
 
         causal_mask[1][0]>=0 # batch中第0个样本的attention_mask, 可以看到左边padding部分的mask均为False
         Out[15]: 
-        tensor([[False, False, False,  ..., False, False, False],
-                [False, False, False,  ..., False, False, False],
-                [False, False, False,  ..., False, False, False],
-                ...,
-                [False, False, False,  ...,  True, False, False],
-                [False, False, False,  ...,  True,  True, False],
-                [False, False, False,  ...,  True,  True,  True]])
+        # x横轴为当前参与attention的key token, y轴为当前的query token
+        tensor([[False, False, False,  False, False, False, False, False],
+                [False, False, False,  False, False, False, False, False],
+                [False, False, False,  False, False, False, False, False],
+                [False, False, False,  False, False, False, False, False],
+                [False, False, False,  False, False, False, False, False],
+                [False, False, False,  False, False,  True, False, False],
+                [False, False, False,  False, False,  True,  True, False],
+                [False, False, False,  False, False,  True,  True,  True]]) # 注意只有最后3列有值
 
         causal_mask[3][0]>=0 # batch中第3个样本的attention_mask，由于第3个样本最长，所以没有left_padding, 可以看到其mask为标准的下三角因果矩阵
         Out[16]: 
-        tensor([[ True, False, False,  ..., False, False, False],
-                [ True,  True, False,  ..., False, False, False],
-                [ True,  True,  True,  ..., False, False, False],
-                ...,
-                [ True,  True,  True,  ...,  True, False, False],
-                [ True,  True,  True,  ...,  True,  True, False],
-                [ True,  True,  True,  ...,  True,  True,  True]])
+        tensor([[ True,  False, False, False,  False, False, False, False],
+                [ True,  True,  False, False,  False, False, False, False],
+                [ True,  True,  True,  False,  False, False, False, False],
+                [ True,  True,  True,  True,   False, False, False, False],
+                [ True,  True,  True,  True,   True,  False, False, False],
+                [ True,  True,  True,  True,   True,  True,  False, False],
+                [ True,  True,  True,  True,   True,  True,  True,  False],
+                [ True,  True,  True,  True,   True,  True,  True,  True]])
         """
         # 在推理阶段时：attention_mask:在推理的prefill阶段为：[batch, num_heads=1, query_seq_len, key_seq_len], 
         # 在后面step by step decoding时 [batch, num_heads=1, query_seq_len=1, key_seq_len]
@@ -926,15 +955,54 @@ class LlamaAttention(nn.Module):
 
         if self.config.pretraining_tp > 1:
             # 张量并行, 矩阵相乘中的列式并行(分块相乘后相加)
+            """
+            X = [ # 按列分块，假设tp_num=2,hidden_size=4,分为2块
+                [x00 x01 | x02 x03],
+                [x10 x11 | x12 x13],
+                [x20 x21 | x22 x23],
+                [x30 x31 | x32 x33],
+            ]
+            = [ XA, XB ] # XA: [4,2]
+
+            W = [ # 按行分块，假设tp_num=2,hidden_size=4,分为2块
+                [w00 w01 w02 w03],
+                [w10 w11 w12 w13],
+                ------------------
+                [w20 w21 w22 w23],
+                [w30 w31 w32 w33],
+            ]
+            = [
+                [WA] shape:[2,4]
+                ----
+                [WB]
+               ]
+
+            X*W = sum_{k}(x(ik)*w(kj)) 
+            张量并行：分块相乘后相加
+            X = [
+                [x00 x01 | x02 x03],
+                [x10 x11 | x12 x13],
+                [x20 x21 | x22 x23],
+                [x30 x31 | x32 x33],
+            ]
+            = XA*WA + XB*WB # shape:[4,4]
+            """
+            # attn_output: [batch_size, query_seq_len, hidden_size], 在hidden_size维按列分块
+            # =>
             # attn_output: ([batch_size, query_seq_len, hidden_size//tp_num],...), 共有tp_num个, 相当于Meta-llama源码中的ColumnParallelLinear按列分块
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+            # o_proj: [hidden_size, hidden_size], 在第1维按行分块
+            # =>
             # o_proj_slices: ([hidden_size, hidden_size//tp_num], ,,,) ,共有tp_num个
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            # 张量并行后，直接将结果相加即可
             # attn_output: [batch_size, query_seq_len, hidden_size]
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
             # 记住：最后还有一次proj
             # q_proj: [hidden_size, hidden_size]
+            # attn_output: [batch_size, query_seq_len, hidden_size]
+            # =>
             # attn_output: [batch_size, query_seq_len, hidden_size]
             attn_output = self.o_proj(attn_output)
 
@@ -1680,6 +1748,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         super().__init__(config)
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
+        # NOTE: 可以看出，LlamaForCasulalLM的lm_head的weight和embed的weight并没有共享的
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -1784,6 +1853,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             loss_fct = CrossEntropyLoss()
             # shift_logits:[batch_size*sequence_length, vocab_size]
             # shift_labels:[batch_size*sequence_length]
+            # 注意：此时的loss变成了token level的loss
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
 

@@ -287,6 +287,9 @@ class GPT2Attention(nn.Module):
         new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
         return tensor.view(new_shape)
 
+    """
+    注意：gpt2支持encoder和decoder，但是decoder的attention_mask是causal_mask，encoder的attention_mask是padding_mask
+    """
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
@@ -611,6 +614,7 @@ class GPT2Block(nn.Module):
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
+        # 1. 先self-attention
         attn_outputs = self.attn(
             hidden_states,
             layer_past=layer_past,
@@ -633,6 +637,7 @@ class GPT2Block(nn.Module):
                 )
             residual = hidden_states
             hidden_states = self.ln_cross_attn(hidden_states)
+            # 2. 再cross-attention
             cross_attn_outputs = self.crossattention(
                 hidden_states,
                 attention_mask=attention_mask,
